@@ -1,0 +1,54 @@
+[Unit]
+Description=ToyTV UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fptv
+Group=fptv
+WorkingDirectory=/opt/fptv
+
+[Service]
+Type=simple
+User=fptv
+WorkingDirectory=/opt/fptv
+ExecStart=/opt/fptv/venv/bin/fptv --no-gpio
+Restart=on-failure
+
+# Still use venv, but install under the autologin user
+# sudo mkdir -p /opt/toytv
+# sudo chown -R pi:pi /opt/fptv
+# copy your repo into /opt/fptv (git clone or rsync)
+# python3 -m venv /opt/fptv/venv
+# /opt/fptv/venv/bin/pip install -U pip
+# /opt/fptv/venv/bin/pip install -e /opt/fptv
+#
+# Enable:
+# systemctl --user daemon-reload
+# systemctl --user enable --now fptv.service
+#
+# You need “linger” so the user’s systemd instance starts on boot:
+# sudo loginctl enable-linger jed
+#
+# Check logs after boot
+# journalctl --user -u fptv -f
+#
+# If this works, you're part of the GUI session when it starts
+
+# If you want it to appear on tty1:
+#StandardInput=tty
+#StandardOutput=tty
+#TTYPath=/dev/tty1
+#TTYReset=yes
+#TTYVHangup=yes
+#TTYVTDisallocate=yes
+
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/fptv/venv/bin/fptv
+
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

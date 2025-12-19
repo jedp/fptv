@@ -1,0 +1,26 @@
+[Unit]
+Description="FPTV: Fisher Price TV"
+After=network.target tvheadend.service
+Requires=tvheadend.service
+
+[Service]
+Type=oneshot
+User=jed
+Group=jed
+SyslogIdentifier=fptv
+
+# Optional: credentials live here
+EnvironmentFile=/etc/fptv-tvheadend-api.env
+
+# Service
+ExecStart=/usr/local/bin/fptv-start.sh
+
+# Hardening (recommended)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+

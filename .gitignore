@@ -1,0 +1,10 @@
+.DS_Store
+*~
+*.sw[op]
+
+*.pyc
+.idea/
+
+build/
+venv/
+
