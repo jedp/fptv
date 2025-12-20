@@ -34,9 +34,9 @@ except Exception:
     RotaryEncoder = None
 
 
-GPIO_ENCODER_A = 11 # GPIO 17
-GPIO_ENCODER_B = 13 # GPIO 27
-GPIO_ENCODER_BUTTON = 15 # GPIO 22
+GPIO_ENCODER_A = 17 # GPIO 11
+GPIO_ENCODER_B = 27 # GPIO 13
+GPIO_ENCODER_BUTTON = 22 # GPIO 15
 
 ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
 TITLE_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
@@ -71,16 +71,11 @@ def get_channels() -> List[Channel]:
 # Events from GPIO
 # ---------------------------
 
-class EvType(Enum):
-    ROT = auto()  # delta = +1/-1
+class Event(Enum):
+    ROT_R = auto()
+    ROT_L = auto()
     PRESS = auto()  # select/back button
     QUIT = auto()  # exit
-
-
-@dataclass(frozen=True)
-class Event:
-    t: EvType
-    delta: int = 0
 
 
 # ---------------------------
@@ -255,15 +250,12 @@ def draw_playing(surface, title_font, item_font, small_font, name: str):
 # GPIO wiring -> event queue
 # ---------------------------
 
-def setup_gpio_events(q: SimpleQueue,
-                      encoder_a=GPIO_ENCODER_A,
-                      encoder_b=GPIO_ENCODER_B,
-                      button_pin=GPIO_ENCODER_BUTTON):
+def setup_encoder(q: SimpleQueue) -> list:
     if not USE_GPIO:
         return None, None
 
-    enc = RotaryEncoder(encoder_a, encoder_b, max_steps=0)
-    btn = Button(button_pin, pull_up=True, bounce_time=0.03)
+    enc = RotaryEncoder(GPIO_ENCODER_A, GPIO_ENCODER_B, max_steps=0)
+    btn = Button(GPIO_ENCODER_BUTTON, pull_up=True, bounce_time=0.03)
 
     last = enc.steps
 
@@ -274,13 +266,14 @@ def setup_gpio_events(q: SimpleQueue,
         if d == 0:
             return
         last = cur
-        q.put(Event(EvType.ROT, delta=1 if d > 0 else -1))
+        q.put(Event.ROT_R if d > 0 else Event.ROT_L)
 
     def on_pressed():
-        q.put(Event(EvType.PRESS))
+        q.put(Event.PRESS)
 
     enc.when_rotated = on_rotated
     btn.when_pressed = on_pressed
+    print("Encoder GPIOs configured")
     return enc, btn
 
 
@@ -308,7 +301,7 @@ def main():
     q: SimpleQueue[Event] = SimpleQueue()
 
     # GPIO event source
-    enc, btn = setup_gpio_events(q)
+    enc, btn = setup_encoder(q)
 
     # Model
     state = State(channels=get_channels())
@@ -333,34 +326,35 @@ def main():
         # Pump pygame events (also gives us QUIT)
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
-                q.put(Event(EvType.QUIT))
+                q.put(Event.QUIT)
             elif dev_keyboard and e.type == pygame.KEYDOWN:
                 if e.key in (pygame.K_ESCAPE,):
-                    q.put(Event(EvType.PRESS))  # treat as “back/stop”
+                    q.put(Event.PRESS)  # treat as "back/stop"
                 elif e.key in (pygame.K_q,):
-                    q.put(Event(EvType.QUIT))
+                    q.put(Event.QUIT)
                 elif e.key in (pygame.K_UP, pygame.K_k):
-                    q.put(Event(EvType.ROT, delta=-1))
+                    q.put(Event.ROT_L)
                 elif e.key in (pygame.K_DOWN, pygame.K_j):
-                    q.put(Event(EvType.ROT, delta=+1))
+                    q.put(Event.ROT_R)
                 elif e.key in (pygame.K_RETURN, pygame.K_SPACE):
-                    q.put(Event(EvType.PRESS))
+                    q.put(Event.PRESS)
 
         # Consume queued GPIO/dev events
         try:
             while True:
                 ev = q.get_nowait()
-                if ev.t == EvType.QUIT:
+                if ev == Event.QUIT:
                     running = False
                     break
 
-                if ev.t == EvType.ROT:
+                if ev == Event.ROT_R or ev == Event.ROT_L:
+                    delta = 1 if ev==Event.ROT_R else -1
                     if state.screen == Screen.MAIN:
-                        state.main_index = max(0, min(2, state.main_index + ev.delta))
+                        state.main_index = max(0, min(2, state.main_index + delta))
                     elif state.screen == Screen.BROWSE and state.channels:
-                        state.browse_index = max(0, min(len(state.channels) - 1, state.browse_index + ev.delta))
+                        state.browse_index = max(0, min(len(state.channels) - 1, state.browse_index + delta))
 
-                elif ev.t == EvType.PRESS:
+                elif ev == Event.PRESS:
                     if state.screen == Screen.MAIN:
                         if state.main_index == 0:  # Browse
                             state.screen = Screen.BROWSE
@@ -385,6 +379,9 @@ def main():
                         mpv.stop()
                         set_blanking(False)
                         state.screen = Screen.BROWSE
+
+                else:
+                    raise ValueError(f"Unknown event: {ev}")
 
         except Empty:
             pass

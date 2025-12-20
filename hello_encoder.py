@@ -111,7 +111,7 @@ def main():
 
     
 if __name__ == '__main__':
-    # follow_inputs()
-    main()
+    follow_inputs()
+    # main()
 
 
