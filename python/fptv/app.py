@@ -43,6 +43,14 @@ TITLE_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 ITEM_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 SMALL_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 
+FG_NORM = (220, 220, 220)
+FG_SEL = (0, 0, 0)
+BG_NORM = (0, 0, 0)
+BG_SEL = (90, 105, 255)
+FG_INACT = (180, 180, 180)
+FG_ACT = (0, 0, 0)
+BG_INACT = (0, 0, 0)
+BG_ACT = (90, 105, 255)
 
 # ---------------------------
 # Model
@@ -189,22 +197,32 @@ def draw_menu(surface, title_font, item_font, title: str,
 
     start_y = 200
     line_h = 70
-    for i, s in enumerate(items):
+    line_w = surface.get_width()
+
+    for i, text in enumerate(items):
         is_sel = (i == selected)
-        prefix = "▶ " if is_sel else "  "
-        color = (255, 255, 0) if is_sel else (220, 220, 220)
-        img = item_font.render(prefix + s, True, color)
-        r = img.get_rect(
-                center=(surface.get_width() // 2, start_y + i * line_h))
-        surface.blit(img, r)
+        # prefix = "▶ " if is_sel else "  "
+        prefix = "  "
+        bg_color = BG_SEL if is_sel else BG_NORM
+        fg_color = FG_SEL if is_sel else FG_NORM
+
+        y = start_y + i * line_h
+        rect = pygame.Rect(0, y, line_w, line_h) 
+        pygame.draw.rect(surface, bg_color, rect)
+
+        text_surf = item_font.render(prefix + text, True, fg_color)
+        text_rect = text_surf.get_rect()
+        text_rect.midleft = (20, y + line_h // 2)
+
+        surface.blit(text_surf, text_rect)
 
 
 def draw_browse(surface, title_font, item_font, small_font,
                 channels: List[Channel], selected: int):
-    surface.fill((0, 0, 0))
-    # Header with Back “affordance”
-    header = "◀ Back"
-    img = small_font.render(header, True, (180, 180, 180))
+    surface.fill(BG_NORM)
+    # Header with Back "affordance"
+    header = "Back"
+    img = small_font.render(header, True, FG_INACT, BG_INACT)
     surface.blit(img, (20, 20))
 
     draw_centered_text(surface, title_font, "Browse", 70)
@@ -224,17 +242,25 @@ def draw_browse(surface, title_font, item_font, small_font,
 
     y0 = 150
     line_h = 52
+    line_w = surface.get_width()
     for row, idx in enumerate(range(start, end)):
-        ch = channels[idx].name
+        text = channels[idx].name
         is_sel = (idx == selected)
-        prefix = "▶ " if is_sel else "  "
-        color = (255, 255, 0) if is_sel else (220, 220, 220)
-        img = item_font.render(prefix + ch, True, color)
-        surface.blit(img, (80, y0 + row * line_h))
+        # prefix = "▶ " if is_sel else "  "
+        prefix = "  "
+        fg_color = FG_SEL if is_sel else FG_NORM
+        bg_color = BG_SEL if is_sel else BG_NORM
+        y = y0 + row * line_h
+        rect = pygame.Rect(0, y, line_w, line_h)
+        pygame.draw.rect(surface, bg_color, rect)
+        text_surf = item_font.render(text, True, fg_color)
+        text_rect = text_surf.get_rect()
+        text_rect.midleft = (20, y + line_h // 2)
+        surface.blit(text_surf, text_rect)
 
     # Footer hint
     hint = "Rotate: scroll    Press: select/stop"
-    img = small_font.render(hint, True, (160, 160, 160))
+    img = small_font.render(hint, True, FG_INACT)
     surface.blit(img, (20, surface.get_height() - 40))
 
 
