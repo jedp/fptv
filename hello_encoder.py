@@ -20,7 +20,7 @@ from typing import List, Optional
 
 GPIO_ENCODER_A = 17 # Pin 11
 GPIO_ENCODER_B = 27 # Pin 13
-GPIO_ENCODER_BUTTON = 22 # Pin 22
+GPIO_ENCODER_BUTTON = 22 # Pin 15
 
 
 class EvType(Enum):
@@ -66,7 +66,6 @@ def encoder_setup(q: SimpleQueue):
     last = encoder.steps
 
     def on_rotated():
-        print("rotate")
         nonlocal last
         cur = encoder.steps
         d = cur - last
@@ -77,7 +76,6 @@ def encoder_setup(q: SimpleQueue):
         q.put(Event(EvType.ROT, delta=1 if d > 0 else -1))
 
     def on_pressed():
-        print("press")
         q.put(Event(EvType.PRESS))
 
     encoder.when_rotated = on_rotated
