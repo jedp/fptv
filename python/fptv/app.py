@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import os
 import pygame
+import re
+import signal
 import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
@@ -43,6 +47,9 @@ TITLE_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 ITEM_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 SMALL_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 
+URL_TVHEADEND = "http://localhost:9981"
+URL_PLAYLIST = f"{URL_TVHEADEND}/playlist/channels"
+
 FG_NORM = (220, 220, 220)
 FG_SEL = (0, 0, 0)
 BG_NORM = (0, 0, 0)
@@ -63,21 +70,47 @@ class Channel:
 
 
 def get_channels() -> List[Channel]:
-    # TODO: Replace with TVHeadend playlist parsing.
-    return [
-        Channel("PBS (demo)", "https://example.com/pbs.m3u8"),
-        Channel("NBC (demo)", "https://example.com/nbc.m3u8"),
-        Channel("CBS (demo)", "https://example.com/cbs.m3u8"),
-        Channel("Weather (demo)", "https://example.com/weather.m3u8"),
-        Channel("Channel 5 (demo)", "https://example.com/5.m3u8"),
-        Channel("Channel 6 (demo)", "https://example.com/6.m3u8"),
-        Channel("Channel 7 (demo)", "https://example.com/7.m3u8"),
-    ]
+    """
+    tvheadend's /playlist/channels returns an m3u file.
+    Lines look like:
 
+        #EXTINF:-1 tvg-id="26e30b9fb6fb20429aac61784fb50ed4" tvg-chno="9.1",KQED-HD
+        http://localhost:9981/stream/channelid/520872742?profile=pass
+    """
+
+    print(f"opening {URL_PLAYLIST}")
+    with urllib.request.urlopen(URL_PLAYLIST, timeout=5) as resp:
+        text = resp.read().decode("utf-8", errors="replace")
+        print(f"resp:\n\n{text}\n\n")
+        lines = text.splitlines()
+
+    channels = []
+    name = None
+
+    for line in lines:
+        print(f"Processing line {line}")
+
+        if line.startswith('#EXTM3U'):
+            continue
+
+        elif line.startswith('#EXTINF'):
+            name = line.strip().split(',')[-1].strip()
+
+        elif line.startswith('http://'):
+            if name is None:
+                raise ValueError(f"No name found before url: {line}")
+            channels.append(Channel(name, line))
+            name = None
+
+        else:
+            raise ValueError(f"Unexpected m3u line: {line}")
+
+    return channels
 
 # ---------------------------
 # Events from GPIO
 # ---------------------------
+
 
 class Event(Enum):
     ROT_R = auto()
@@ -124,35 +157,52 @@ def x11_blanking_enable() -> None:
 
 class MPV:
     def __init__(self) -> None:
-        self.p: Optional[subprocess.Popen] = None
+        self.proc: Optional[subprocess.Popen] = None
 
     def start(self, url: str) -> None:
         self.stop()
 
-        # For X desktop, mpv will open its own window
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+
+        # For X desktop, mpv will open its own window.
         # We ask it to go fullscreen.
         cmd = [
             "mpv",
             "--fullscreen",
             "--no-terminal",
             "--force-window=yes",  # Ensure a window is created.
+            "--ontop=yes",
+            "--keep-open=no",
+            "--no-osc",
+            "--really-quiet",
             url,
         ]
-        self.p = subprocess.Popen(cmd)
+        self.proc = subprocess.Popen(
+                cmd,
+                env=env,
+                start_new_session=True, # New process group
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
 
     def stop(self) -> None:
-        if not self.p:
+        if not self.proc:
             return
-        if self.p.poll() is None:
+
+        if self.proc.poll() is not None:
+            return
+
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except Exception:
             try:
-                self.p.terminate()
-                self.p.wait(timeout=2)
+                print(f"mpv did not exit gracefully when asked. Killing.")
+                self.proc.kill()
             except Exception:
-                try:
-                    self.p.kill()
-                except Exception:
-                    pass
-        self.p = None
+                pass
+        finally:
+            self.proc = None
 
 
 # ---------------------------
@@ -182,6 +232,16 @@ class State:
 # ---------------------------
 # Rendering helpers
 # ---------------------------
+
+
+def bring_fptv_to_front():
+    subprocess.run(["wmctrl", "-a", "FPTV"], check=False)
+
+
+def draw_black_screen(surface: pygame.Surface) -> None:
+    surface.fill(BG_NORM)
+    pygame.display.flip()
+
 
 def draw_centered_text(surface, font, text, y, bold=False):
     color = (255, 255, 255)
@@ -316,7 +376,7 @@ def main():
 
     # Fullscreen desktop resolution
     surface = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    pygame.display.set_caption("Toy TV")
+    pygame.display.set_caption("FPTV")
 
     # Fonts (use default; you can bundle a TTF later)
     title_font = pygame.font.Font(TITLE_FONT, 92)
@@ -403,8 +463,14 @@ def main():
 
                     elif state.screen == Screen.PLAYING:
                         mpv.stop()
-                        set_blanking(False)
                         state.screen = Screen.BROWSE
+                        print(f"Player done. Mode is browse")
+                        pygame.event.pump()
+                        bring_fptv_to_front()
+                        draw_browse(surface, title_font, item_font, small_font,
+                                    state.channels, state.browse_index)
+                        pygame.display.flip()
+                        pygame.event.pump()
 
                 else:
                     raise ValueError(f"Unknown event: {ev}")
