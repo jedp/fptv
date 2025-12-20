@@ -1,0 +1,31 @@
+python3-pygame:
+  Installed: 2.6.1-1+b2
+  Candidate: 2.6.1-1+b2
+  Version table:
+ *** 2.6.1-1+b2 500
+        500 http://deb.debian.org/debian trixie/main arm64 Packages
+        100 /var/lib/dpkg/status
+python3-gpiozero:
+  Installed: 2.0.1-0+rpt1+trixie
+  Candidate: 2.0.1-0+rpt1+trixie
+  Version table:
+ *** 2.0.1-0+rpt1+trixie 500
+        500 http://archive.raspberrypi.com/debian trixie/main arm64 Packages
+        500 http://archive.raspberrypi.com/debian trixie/main armhf Packages
+        100 /var/lib/dpkg/status
+     1.6.2-1+b1 500
+        500 http://deb.debian.org/debian trixie/main arm64 Packages
+mpv:
+  Installed: 0.40.0-3+deb13u1
+  Candidate: 0.40.0-3+deb13u1
+  Version table:
+ *** 0.40.0-3+deb13u1 500
+        500 http://deb.debian.org/debian trixie/main arm64 Packages
+        100 /var/lib/dpkg/status
+tvheadend:
+  Installed: 4.3-2471~g5fd594910~trixie
+  Candidate: 4.3-2471~g5fd594910~trixie
+  Version table:
+ *** 4.3-2471~g5fd594910~trixie 500
+        500 http://archive.raspberrypi.com/debian trixie/main arm64 Packages
+        100 /var/lib/dpkg/status
