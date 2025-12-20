@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 
 """
-GPIO access: on Raspberry Pi OS, gpiozero usually works if the user is in
-the gpio group (and you’re using the modern gpio character device). If you hit
-permission issues, check /dev/gpiochip* permissions and group membership.
-
 mpv output: if you later go console-only (no desktop), you may need to adjust
 mpv flags to use KMS/DRM output rather than X11/Wayland. Your existing setup
 already works; keep it as-is until you change display stack.
@@ -13,13 +9,14 @@ tvheadend auth: if your playlist needs credentials, store them in a config file
 readable by toytv (not world-readable) and load at runtime.
 """
 
-# !/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import pygame
 import re
 import signal
+import socket
 import subprocess
 import time
 import urllib.request
@@ -49,6 +46,10 @@ SMALL_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 
 URL_TVHEADEND = "http://localhost:9981"
 URL_PLAYLIST = f"{URL_TVHEADEND}/playlist/channels"
+
+MPV_SOCK="/tmp/fptv-mpv.sock"
+
+UI_WIN = "fptv.fptv"
 
 FG_NORM = (220, 220, 220)
 FG_SEL = (0, 0, 0)
@@ -156,53 +157,165 @@ def x11_blanking_enable() -> None:
 # ---------------------------
 
 class MPV:
-    def __init__(self) -> None:
+    def __init__(self, sock_path: str = MPV_SOCK) -> None:
         self.proc: Optional[subprocess.Popen] = None
+        self.sock_path = sock_path
 
-    def start(self, url: str) -> None:
-        self.stop()
+    def spawn(self) -> None:
+        if self._is_running():
+            return True
 
         env = os.environ.copy()
         env.setdefault("DISPLAY", ":0")
 
-        # For X desktop, mpv will open its own window.
-        # We ask it to go fullscreen.
+        # Remove any stale socket.
+        try:
+            os.unlink(self.sock_path)
+        except FileNotFoundError:
+            pass
+
+
         cmd = [
             "mpv",
+            #f"--wid={xid}",
+            f"--input-ipc-server={self.sock_path}",
+            "--idle=yes",
+            "--force-window=yes",
+
+            "--keep-open=yes", # Keep window alive
             "--fullscreen",
+            "--ontop=no",
+            "--title=mpv-fptv",
+            "--no-border",
+
+
+            "--osc=no",
+            "--osd-level=0",
             "--no-terminal",
-            "--force-window=yes",  # Ensure a window is created.
-            "--ontop=yes",
-            "--keep-open=no",
-            "--no-osc",
             "--really-quiet",
-            url,
+
+            "--image-display-duration=0",
+            "--no-input-default-bindings",
+            "--background=color", # Make it invisible on startup
+            "--background-color=#000000",
+            # Optional - may reduce latency / buffering lag
+            # "--cache=no",
+            # "--untimed=yes",
         ]
+        print(f"Exec: {cmd}")
+
         self.proc = subprocess.Popen(
                 cmd,
                 env=env,
-                start_new_session=True, # New process group
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
+                # start_new_session=True, # New process group
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+
+        print(f"mpv pid: {self.proc.pid}")
+        time.sleep(2.0)
+        rc = self.proc.poll()
+        print(f"mpv poll: {rc}")
+        if rc is not None:
+            out, err = self.proc.communicate(timeout=0.2)
+            print(f"mpv stdout: {out}")
+            print(f"mpv stderr: {err}")
+            self.proc = None
+            return
+
+        self._wait_for_socket()
+
+    def play(self, url: str) -> None:
+        self.spawn()
+
+        # Make player visible again.
+        self._cmd(["set_property", "vid", "auto"])
+
+        ok = self._cmd(["loadfile", url, "replace"])
+        if not ok:
+            print("Error playing. Trying to restart.")
+            self.shutdown()
+            self.spawn()
+            self._cmd(["loadfile", url, "replace"])
+
+        self._cmd(["set_property", "pause", False])
+
 
     def stop(self) -> None:
         if not self.proc:
             return
 
         if self.proc.poll() is not None:
+            self.proc = None
             return
 
-        try:
+        # Stop playback, but keep mpv running.
+        self._cmd(["stop"])
+        self._cmd(["set_property", "pause", True])
+        # Force black screen
+        self._cmd(["set_property", "vid", "no"])
+
+
+    def shutdown(self) -> None:
+        if not self.proc:
+            return
+
+        if self.proc.poll() is not None:
+            self.proc = None
+            return
+
+        # Try to shutdown nicely.
+        if not self._cmd(["quit"]):
             self.proc.terminate()
+
+        try:
             self.proc.wait(timeout=2)
         except Exception:
-            try:
-                print(f"mpv did not exit gracefully when asked. Killing.")
-                self.proc.kill()
-            except Exception:
-                pass
+            self.proc.kill()
         finally:
             self.proc = None
+
+    def _cmd(self, cmd: list) -> bool:
+        """
+        Execute a command like ["stop"] or ["loadfile", url, "replace"]
+        """
+
+        if not os.path.exists(self.sock_path):
+            print(f"Not found: {self.sock_path}")
+            return False
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                s.connect(self.sock_path)
+                dumped = json.dumps({"command": cmd}) + "\n"
+                print(f"Sending: {dumped.strip()}")
+                s.sendall(dumped.encode("utf-8"))
+            return True
+
+        except OSError as e:
+            print(f"OSError in _cmd: {e}")
+            return False
+
+    def _wait_for_socket(self, timeout_s: float = 5.0) -> bool:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if os.path.exists(self.sock_path):
+                return True
+
+            #print("Waiting for socket ...")
+            #if self.proc and self.proc.poll() is not None:
+            #    err = self.proc.stderr.read().decode("utf-8", "replace") if self.proc.stderr else ""
+            #    print(f"mpv exited with error: {err}")
+            #    print(err)
+            #    return False
+
+            time.sleep(0.02)
+
+        print("Timed out waiting for socket")
+        return False
+
+    def _is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
 
 
 # ---------------------------
@@ -234,13 +347,15 @@ class State:
 # ---------------------------
 
 
-def bring_fptv_to_front():
-    subprocess.run(["wmctrl", "-a", "FPTV"], check=False)
+def ui_show():
+    subprocess.run(["wmctrl", "-x", "-r", UI_WIN, "-b", "remove,below"], check=False)
+    subprocess.run(["wmctrl", "-x", "-r", UI_WIN, "-b", "add,above,sticky,skip_taskbar,skip_pager"], check=False)
+    subprocess.run(["wmctrl", "-x", "-a", UI_WIN], check=False)
 
 
-def draw_black_screen(surface: pygame.Surface) -> None:
-    surface.fill(BG_NORM)
-    pygame.display.flip()
+def ui_hide():
+    subprocess.run(["wmctrl", "-x", "-r", UI_WIN, "-b", "remove,above"], check=False)
+    subprocess.run(["wmctrl", "-x", "-r", UI_WIN, "-b", "add,below"], check=False)
 
 
 def draw_centered_text(surface, font, text, y, bold=False):
@@ -370,13 +485,15 @@ def setup_encoder(q: SimpleQueue) -> list:
 def main():
     # Make SDL a bit more kiosk-friendly.
     os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
+    os.environ["SDL_VIDEO_X11_WMCLASS"] = "fptv"
 
     pygame.init()
     pygame.mouse.set_visible(False)  # hide cursor
 
     # Fullscreen desktop resolution
     surface = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-    pygame.display.set_caption("FPTV")
+    pygame.display.set_caption("fptv")
+    time.sleep(1.0)
 
     # Fonts (use default; you can bundle a TTF later)
     title_font = pygame.font.Font(TITLE_FONT, 92)
@@ -391,7 +508,12 @@ def main():
 
     # Model
     state = State(channels=get_channels())
+
     mpv = MPV()
+    mpv.spawn()
+
+    time.sleep(1.0)
+    ui_show()
 
     # Keyboard support for development (optional)
     dev_keyboard = True
@@ -459,18 +581,15 @@ def main():
                         state.playing_name = ch.name
                         state.screen = Screen.PLAYING
                         set_blanking(True)  # disable blanking while playing
-                        mpv.start(ch.url)
+                        ui_hide()
+                        mpv.play(ch.url)
 
                     elif state.screen == Screen.PLAYING:
                         mpv.stop()
+                        set_blanking(False)
+                        ui_show()
                         state.screen = Screen.BROWSE
                         print(f"Player done. Mode is browse")
-                        pygame.event.pump()
-                        bring_fptv_to_front()
-                        draw_browse(surface, title_font, item_font, small_font,
-                                    state.channels, state.browse_index)
-                        pygame.display.flip()
-                        pygame.event.pump()
 
                 else:
                     raise ValueError(f"Unknown event: {ev}")
@@ -480,17 +599,14 @@ def main():
 
         # Render current screen
         if state.screen == Screen.MAIN:
-            set_blanking(False)
             draw_menu(surface, title_font, item_font,
                       "FPTV", ["Browse", "Scan", "Shutdown"], state.main_index)
 
         elif state.screen == Screen.SCAN:
-            set_blanking(False)
             draw_menu(surface, title_font, item_font,
                       "Scan", ["(not implemented)", "Press to go back"], 1)
 
         elif state.screen == Screen.BROWSE:
-            set_blanking(False)
             draw_browse(surface, title_font, item_font, small_font,
                         state.channels, state.browse_index)
 
@@ -500,12 +616,13 @@ def main():
             # If mpv is fullscreen, you may not see this.
             draw_playing(surface, title_font, item_font, small_font,
                          state.playing_name)
+            pass
 
         pygame.display.flip()
         clock.tick(30)
 
     # Cleanup
-    mpv.stop()
+    mpv.shutdown()
     set_blanking(False)
     pygame.quit()
     return 0
