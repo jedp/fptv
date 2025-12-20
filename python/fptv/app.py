@@ -17,6 +17,7 @@ readable by toytv (not world-readable) and load at runtime.
 from __future__ import annotations
 
 import os
+import pygame
 import subprocess
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -32,7 +33,15 @@ except Exception:
     Button = None
     RotaryEncoder = None
 
-import pygame
+
+GPIO_ENCODER_A = 11 # GPIO 17
+GPIO_ENCODER_B = 13 # GPIO 27
+GPIO_ENCODER_BUTTON = 15 # GPIO 22
+
+ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
+TITLE_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
+ITEM_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
+SMALL_FONT = f"{ASSETS_FONT}/VeraSe.ttf"
 
 
 # ---------------------------
@@ -80,7 +89,9 @@ class Event:
 
 def run_quiet(cmd: List[str]) -> None:
     try:
-        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=False,
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
@@ -115,12 +126,13 @@ class MPV:
     def start(self, url: str) -> None:
         self.stop()
 
-        # For X desktop, mpv will open its own window; we ask it to go fullscreen.
+        # For X desktop, mpv will open its own window
+        # We ask it to go fullscreen.
         cmd = [
             "mpv",
             "--fullscreen",
             "--no-terminal",
-            "--force-window=yes",  # ensure a window is created (useful for some streams)
+            "--force-window=yes",  # Ensure a window is created.
             url,
         ]
         self.p = subprocess.Popen(cmd)
@@ -175,7 +187,8 @@ def draw_centered_text(surface, font, text, y, bold=False):
     surface.blit(img, r)
 
 
-def draw_menu(surface, title_font, item_font, title: str, items: List[str], selected: int):
+def draw_menu(surface, title_font, item_font, title: str,
+              items: List[str], selected: int):
     surface.fill((0, 0, 0))
     draw_centered_text(surface, title_font, title, 90)
 
@@ -186,11 +199,13 @@ def draw_menu(surface, title_font, item_font, title: str, items: List[str], sele
         prefix = "▶ " if is_sel else "  "
         color = (255, 255, 0) if is_sel else (220, 220, 220)
         img = item_font.render(prefix + s, True, color)
-        r = img.get_rect(center=(surface.get_width() // 2, start_y + i * line_h))
+        r = img.get_rect(
+                center=(surface.get_width() // 2, start_y + i * line_h))
         surface.blit(img, r)
 
 
-def draw_browse(surface, title_font, item_font, small_font, channels: List[Channel], selected: int):
+def draw_browse(surface, title_font, item_font, small_font,
+                channels: List[Channel], selected: int):
     surface.fill((0, 0, 0))
     # Header with Back “affordance”
     header = "◀ Back"
@@ -200,7 +215,8 @@ def draw_browse(surface, title_font, item_font, small_font, channels: List[Chann
     draw_centered_text(surface, title_font, "Browse", 70)
 
     if not channels:
-        draw_centered_text(surface, item_font, "No channels", surface.get_height() // 2)
+        draw_centered_text(
+                surface, item_font, "No channels", surface.get_height() // 2)
         return
 
     # Show a window around selection
@@ -239,7 +255,10 @@ def draw_playing(surface, title_font, item_font, small_font, name: str):
 # GPIO wiring -> event queue
 # ---------------------------
 
-def setup_gpio_events(q: SimpleQueue, encoder_a=17, encoder_b=27, button_pin=22):
+def setup_gpio_events(q: SimpleQueue,
+                      encoder_a=GPIO_ENCODER_A,
+                      encoder_b=GPIO_ENCODER_B,
+                      button_pin=GPIO_ENCODER_BUTTON):
     if not USE_GPIO:
         return None, None
 
@@ -281,9 +300,9 @@ def main():
     pygame.display.set_caption("Toy TV")
 
     # Fonts (use default; you can bundle a TTF later)
-    title_font = pygame.font.Font(None, 92)
-    item_font = pygame.font.Font(None, 56)
-    small_font = pygame.font.Font(None, 32)
+    title_font = pygame.font.Font(TITLE_FONT, 92)
+    item_font = pygame.font.Font(ITEM_FONT, 56)
+    small_font = pygame.font.Font(SMALL_FONT, 32)
 
     clock = pygame.time.Clock()
     q: SimpleQueue[Event] = SimpleQueue()
@@ -373,20 +392,25 @@ def main():
         # Render current screen
         if state.screen == Screen.MAIN:
             set_blanking(False)
-            draw_menu(surface, title_font, item_font, "Toy TV", ["Browse", "Scan", "Shutdown"], state.main_index)
+            draw_menu(surface, title_font, item_font,
+                      "FPTV", ["Browse", "Scan", "Shutdown"], state.main_index)
 
         elif state.screen == Screen.SCAN:
             set_blanking(False)
-            draw_menu(surface, title_font, item_font, "Scan", ["(not implemented)", "Press to go back"], 1)
+            draw_menu(surface, title_font, item_font,
+                      "Scan", ["(not implemented)", "Press to go back"], 1)
 
         elif state.screen == Screen.BROWSE:
             set_blanking(False)
-            draw_browse(surface, title_font, item_font, small_font, state.channels, state.browse_index)
+            draw_browse(surface, title_font, item_font, small_font,
+                        state.channels, state.browse_index)
 
         elif state.screen == Screen.PLAYING:
-            # we keep drawing a simple “Playing” overlay; mpv will be fullscreen too.
-            # If mpv is fullscreen, you may not see this. That’s okay.
-            draw_playing(surface, title_font, item_font, small_font, state.playing_name)
+            # We keep drawing a simple "Playing" overlay.
+            # mpv will be fullscreen, too.
+            # If mpv is fullscreen, you may not see this.
+            draw_playing(surface, title_font, item_font, small_font,
+                         state.playing_name)
 
         pygame.display.flip()
         clock.tick(30)
