@@ -15,7 +15,7 @@ from event import Event
 from hw import setup_encoder
 from mpv import MPV
 from render import draw_menu, draw_browse, draw_playing
-from tvheadend import get_channels, Channel
+from channels import get_channels, Channel
 from x11 import blanking_disable, blanking_enable, ui_show, ui_hide, mpv_raise, mpv_lower
 
 FPTV_CAPTION = 'fptv'

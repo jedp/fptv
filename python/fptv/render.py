@@ -4,7 +4,7 @@ from typing import List
 
 import pygame
 
-from tvheadend import Channel
+from channels import Channel
 
 FG_NORM = (220, 220, 220)
 FG_SEL = (0, 0, 0)
