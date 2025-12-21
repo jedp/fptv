@@ -3,22 +3,38 @@
 """
 TVHeadend ATSC OTA scanner.
 
-Goals:
- 1) Find ATSC OTA network UUID by name
- 2) (Optional) delete existing muxes for that network
- 3) Create muxes for ATSC RF channels (2–36, or 14–36)
- 4) Force scan all muxes
- 5) Poll until scanning settles
- 6) (Optional) trigger service mapping
+Ownership model:
+ - No human users
+ - No WebUI edits (except debugging)
+ - Appliance owns full lifecycle
+ - Destructive cleanup is acceptable
+
+Tuner usage rules:
+ - No initial EPG grabs
+ - No periodic OTA scans during normal operation
+ - Live streaming has absolute priority
+
+Scan Pipeline:
+ - Ensure ATSC-T frontends enabled + network-linked
+ - Wipe muxes (optional)
+ - Create muxes deterministically
+ - Force scan
+ - Wait until settled
+ - Delete orphan channels
+ - Map services → channels
+ - Delete unnamed channels
+ - Deduplicate channels by name
+ - Prune invalid services per channel ← final safety net
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from dataclasses import dataclass
-from typing import Optional, List, Callable
+from typing import Callable, Iterable, Optional, List, Set
 
 import requests
 from requests.auth import HTTPDigestAuth
@@ -28,6 +44,12 @@ from log import Logger
 
 def json_dumps(obj: object) -> str:
     return json.dumps(obj, separators=(',', ':'), ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class Channel:
+    name: str
+    url: str
 
 
 @dataclass
@@ -46,6 +68,7 @@ class ScanConfig:
     modulation: str = "VSB/8"
     sleep_secs: float = 2.0
     timeout_secs: int = 600  # 10 minutes
+    dry_run: bool = False
 
     @classmethod
     def from_env(cls) -> ScanConfig:
@@ -64,6 +87,7 @@ class ScanConfig:
             modulation=os.getenv("MODULATION", "VSB/8"),
             sleep_secs=float(os.getenv("SLEEP_SECS", "2")),
             timeout_secs=int(os.getenv("TIMEOUT_SECS", "600")),
+            dry_run=os.getenv("DRY_RUN", "0") == "1",
         )
 
 
@@ -78,7 +102,7 @@ class MuxStates:
 
     def is_settled(self) -> bool:
         """Returns True if no muxes are actively scanning."""
-        return self.active + self.pending == 0
+        return (self.active + self.pending) == 0
 
     def __str__(self) -> str:
         return f"ACTIVE: {self.active}, PENDING: {self.pending}, OK: {self.ok}, FAIL: {self.fail}, IDLE: {self.idle}, TOTAL: {self.total}"
@@ -95,17 +119,45 @@ class TVHeadendScanner:
             self.auth = HTTPDigestAuth(config.user, config.password)
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
-        """Make an authenticated request to TVHeadend API."""
+        """
+        Make an authenticated request to TVHeadend API with sane defaults + simple retry.
+        """
         url = f"{self.config.base_url}{endpoint}"
         kwargs.setdefault("auth", self.auth)
-        response = requests.request(method, url, **kwargs)
-        # Don't raise_for_status here - let callers handle errors
-        return response
+        kwargs.setdefault("timeout", 10)
+
+        # Light retry for transient 5xx / connection hiccups.
+        attempts = 3
+        resp = None
+        for i in range(attempts):
+            try:
+                resp = requests.request(method, url, **kwargs)
+            except requests.RequestException as e:
+                if i == attempts - 1:
+                    raise
+                time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
+                continue
+
+            if resp.status_code >= 500 and i < attempts - 1:
+                time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
+                continue
+
+            return resp
+
+        return resp  # pragma: no cover
 
     def _get(self, endpoint: str, **kwargs) -> requests.Response:
         response = self._request("GET", endpoint, **kwargs)
         response.raise_for_status()
         return response
+
+    def _get_json(self, endpoint: str, **kwargs) -> dict:
+        r = self._get(endpoint, **kwargs)
+        try:
+            return r.json()
+        except ValueError:
+            self.log.err(f"Non-JSON response for {endpoint}: {r.text[:300]}")
+            raise
 
     def _post(self, endpoint: str, **kwargs) -> requests.Response:
         # POST requests often return non-200 codes that we handle gracefully
@@ -190,6 +242,251 @@ class TVHeadendScanner:
         # enabled True > False; has_mm True > False; lower major is better => use negative major
         return enabled, has_mm, -major, svc_count
 
+    @staticmethod
+    def _channel_stream_id(ch: dict) -> Optional[str]:
+        """
+        Extract numeric channelid used by /stream/channelid/<id>.
+        Tries common field names.
+        """
+        for k in ("chid", "channelid", "id"):
+            v = ch.get(k)
+            if isinstance(v, int):
+                return str(v)
+            if isinstance(v, str) and v.isdigit():
+                return v
+        return None
+
+    def _enum_key_for_label(self, prop: dict, label_substr: str) -> Optional[object]:
+        for e in (prop.get("enum") or []):
+            if not isinstance(e, dict):
+                continue
+            if label_substr.lower() in str(e.get("val", "")).lower():
+                return e.get("key")
+
+        self.log.out(f"Did not find enum key for label: {label_substr}")
+        return None
+
+    def _find_prop(self, mux_class: dict, *, id_contains=(), caption_contains=()) -> Optional[dict]:
+        for p in (mux_class.get("props") or []):
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("id")
+            cap = p.get("caption") or ""
+            if not isinstance(pid, str):
+                continue
+            low_id = pid.lower()
+            low_cap = str(cap).lower()
+
+            if id_contains and not any(s in low_id for s in id_contains):
+                continue
+            if caption_contains and not any(s in low_cap for s in caption_contains):
+                continue
+            self.log.out(f"Found prop id: {pid}")
+            return p
+
+        self.log.out(f"Did not find prop for mux_class: {mux_class}")
+        return None
+
+    def _iter_hw_tree(self, start_uuid: str = "root") -> Iterable[dict]:
+        """
+        Depth-first walk of /api/hardware/tree starting from start_uuid.
+        Yields every node dict returned by the API.
+        """
+        stack = [start_uuid]
+        seen: Set[str] = set()
+
+        while stack:
+            u = stack.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+
+            resp = self._get("/api/hardware/tree", params={"uuid": u})
+            try:
+                nodes = resp.json()
+            except ValueError:
+                self.log.err(f"hardware/tree returned non-JSON for uuid={u}: {resp.text[:200]}")
+                continue
+
+            if not isinstance(nodes, list):
+                self.log.err(f"hardware/tree unexpected shape for uuid={u}: {nodes}")
+                continue
+
+            for n in nodes:
+                if not isinstance(n, dict):
+                    continue
+                yield n
+                # If leaf == 0, it has children; per TVH tree API, use node uuid as next uuid.
+                nu = n.get("uuid") or n.get("id")
+                if n.get("leaf") == 0 and isinstance(nu, str) and nu:
+                    stack.append(nu)
+
+    @staticmethod
+    def _is_atsc_t_frontend_node(node: dict) -> bool:
+        """
+        Heuristic: match LinuxDVB ATSC terrestrial frontends.
+        Your nodes look like class 'linuxdvb_frontend_atsc_t' and event 'mpegts_input'.
+        """
+        cls = node.get("class", "")
+        txt = node.get("text", "")
+        if not isinstance(cls, str):
+            cls = ""
+        if not isinstance(txt, str):
+            txt = ""
+
+        c = cls.lower()
+        t = txt.lower()
+        return ("linuxdvb_frontend_atsc_t" in c) or ("atsc-t" in t) or ("atsc t" in t) or ("atsc_t" in t)
+
+    def _maybe_save_idnode_params(self, uuid: str, cls: Optional[str], changes: dict) -> bool:
+        if self.config.dry_run:
+            self.log.out(f"[dry-run] Would idnode/save uuid={uuid} class={cls} changes={changes}")
+            return True
+        return self.idnode_save_params(uuid=uuid, cls=cls, changes=changes)
+
+    def _idnode_load_entry(self, uuid: str) -> Optional[dict]:
+        loaded = self._get("/api/idnode/load", params={"uuid": uuid}).json()
+        ent = (loaded.get("entries") or [None])[0]
+        return ent if isinstance(ent, dict) else None
+
+    def _idnode_params_to_map(self, entry: dict) -> dict:
+        """
+        Convert idnode/load entry params array into {id: value}.
+        """
+        out = {}
+        for p in (entry.get("params") or []):
+            if isinstance(p, dict) and isinstance(p.get("id"), str):
+                out[p["id"]] = p.get("value")
+        return out
+
+    def _service_name_from_idnode(self, service_uuid: str) -> Optional[str]:
+        ent = self._idnode_load_entry(service_uuid)
+        if not ent:
+            return None
+        params = self._idnode_params_to_map(ent)
+        v = params.get("svcname")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        return None
+
+    @staticmethod
+    def _mux_is_ok(mux_info: dict) -> bool:
+        """
+        scan_result is int on your build: 1=OK, 2=FAIL, 0=NONE/unknown.
+        Treat enabled + OK as "good".
+        """
+        if not mux_info.get("enabled", True):
+            return False
+        r = mux_info.get("scan_result")
+        if isinstance(r, int):
+            return r == 1
+        if isinstance(r, str):
+            return r.upper() == "OK"
+        return False
+
+    def get_mux_health_for_network(self, net_uuid: str) -> dict[str, dict]:
+        """
+        Robust: accept network_uuid OR (when only network name is present) match by your config.net_name.
+        """
+        data = self._get_json("/api/mpegts/mux/grid?limit=99999")
+        out: dict[str, dict] = {}
+
+        for e in data.get("entries", []):
+            if not isinstance(e, dict):
+                continue
+
+            nu = e.get("network_uuid")
+            nn = e.get("network")  # sometimes name, sometimes uuid depending on build
+            if nu != net_uuid and nn not in (net_uuid, self.config.net_name):
+                continue
+
+            mux_uuid = e.get("uuid")
+            if not isinstance(mux_uuid, str) or not mux_uuid:
+                continue
+
+            out[mux_uuid] = {
+                "enabled": bool(e.get("enabled", True)),
+                "scan_result": e.get("scan_result"),
+                "scan_state": e.get("scan_state"),
+            }
+
+        return out
+
+    def get_good_muxes(self, net_uuid: str) -> Set[str]:
+        mux_health = self.get_mux_health_for_network(net_uuid)
+        return {m for (m, info) in mux_health.items() if self._mux_is_ok(info)}
+
+    def ensure_atsc_t_frontends_enabled_and_linked(self, net_uuid: str) -> dict:
+        """
+        Enable all ATSC-T frontends and ensure they're assigned to the given network UUID.
+
+        Returns stats dict.
+        """
+        found = 0
+        updated = 0
+        enabled_count = 0
+        linked_count = 0
+        errors = 0
+
+        for node in self._iter_hw_tree("root"):
+            nu = node.get("uuid") or node.get("id")
+            if not isinstance(nu, str) or not nu:
+                continue
+
+            if not self._is_atsc_t_frontend_node(node):
+                continue
+
+            found += 1
+            entry = self._idnode_load_entry(nu)
+            if not entry:
+                self.log.err(f"Could not idnode/load frontend uuid={nu} text={node.get('text')}")
+                errors += 1
+                continue
+
+            params_map = self._idnode_params_to_map(entry)
+
+            # Determine current state
+            cur_enabled = bool(params_map.get("enabled"))
+            cur_networks = params_map.get("networks") or []
+            if not isinstance(cur_networks, list):
+                cur_networks = []
+
+            new_networks = list(cur_networks)
+            if net_uuid not in new_networks:
+                new_networks.append(net_uuid)
+
+            changes = {}
+            if not cur_enabled:
+                changes["enabled"] = True
+            if new_networks != cur_networks:
+                changes["networks"] = new_networks
+
+            if not changes:
+                # Already configured
+                enabled_count += int(cur_enabled)
+                linked_count += int(net_uuid in cur_networks)
+                continue
+
+            # Dry-run safe
+            ok = self._maybe_save_idnode_params(uuid=nu, cls=entry.get("class"), changes=changes)
+            if ok:
+                updated += 1
+                # Count post-change intended state
+                enabled_count += 1
+                linked_count += 1
+                self.log.out(f"Configured frontend: {node.get('text')} uuid={nu} changes={changes}")
+            else:
+                errors += 1
+                self.log.err(f"Failed to configure frontend uuid={nu} text={node.get('text')} changes={changes}")
+
+        return {
+            "frontends_found": found,
+            "frontends_updated": updated,
+            "frontends_enabled": enabled_count,
+            "frontends_linked_to_net": linked_count,
+            "errors": errors,
+        }
+
     def get_network_uuid(self) -> Optional[str]:
         """Find network UUID by name."""
         response = self._get("/api/mpegts/network/grid?limit=9999")
@@ -201,6 +498,44 @@ class TVHeadendScanner:
                 return entry.get("uuid")
 
         return None
+
+    def set_epg_grabbers_enabled(self, enabled: bool) -> bool:
+        """
+        On this build, /api/epggrab/config/save expects form field:
+          node=<JSON object of config fields>
+        Not an idnode params array.
+
+        enabled=False disables startup grabs + clears cron schedules (appliance-safe).
+        """
+        loaded = self._get_json("/api/epggrab/config/load")
+        entry = (loaded.get("entries") or [None])[0]
+        if not isinstance(entry, dict):
+            self.log.err(f"epggrab/config/load unexpected: {loaded}")
+            return False
+
+        # Build node from current values, preserving everything TVH knows about.
+        node: dict = {}
+        for p in (entry.get("params") or []):
+            if isinstance(p, dict) and isinstance(p.get("id"), str):
+                node[p["id"]] = p.get("value")
+
+        node["int_initial"] = bool(enabled)
+        node["ota_initial"] = bool(enabled)
+
+        if not enabled:
+            node["cron"] = ""
+            node["ota_cron"] = ""
+
+        if self.config.dry_run:
+            self.log.out(f"[dry-run] Would epggrab/config/save node={node}")
+            return True
+
+        resp = self._post("/api/epggrab/config/save", data={"node": json_dumps(node)})
+        if resp.status_code == 200:
+            return True
+
+        self.log.err(f"epggrab/config/save failed: {resp.status_code} {resp.text}")
+        return False
 
     def list_muxes_for_network(self, net_uuid: str) -> List[str]:
         """List all mux UUIDs for a given network."""
@@ -263,7 +598,11 @@ class TVHeadendScanner:
             if resp.status_code == 200:
                 return True
 
-        self.log.err(f"idnode_save failed: {resp.status_code} {resp.text} node={node}")
+            self.log.err(f"idnode_save failed: {resp.status_code} {resp.text} node={node}")
+
+        else:
+            self.log.err(f"No uuid found in node. Cannot save.")
+
         return False
 
     def idnode_save_params(self, uuid: str, cls: Optional[str], changes: dict) -> bool:
@@ -366,44 +705,46 @@ class TVHeadendScanner:
 
     def create_mux_atsc(self, net_uuid: str, freq_hz: int) -> bool:
         """
-        Create a mux on an existing network using the correct API:
-          POST /api/mpegts/network/mux_create
-            - uuid=<network_uuid>
-            - conf=<json>
+        Never set onid, tsid, name, pmt_06_ac3, etc., at creation unless you know you must.
+        Otherwise you may bake in bogus values, like 65536.
         """
         try:
             mux_class = self.get_mux_class(net_uuid)
-            conf = self.build_mux_conf_from_defaults(mux_class)
 
-            # Set the frequency (this field should exist for terrestrial/atsc)
-            conf["frequency"] = int(freq_hz)
+            conf = {
+                "enabled": 1,
+                "frequency": int(freq_hz),
+                "modulation": "VSB/8"
+            }
 
-            # If these fields exist for your mux type, set them.
-            # They’re present on many builds, but not all.
-            if "modulation" in conf:
+            # modulation (only if this mux class supports it)
+            # (some builds use "modulation", some do not)
+            # We'll set it if it exists in the class props.
+            prop_ids = {p.get("id") for p in (mux_class.get("props") or []) if isinstance(p, dict)}
+            if "modulation" in prop_ids:
                 conf["modulation"] = self.config.modulation
 
-            # Queue a scan if scan_state exists (1 == PEND in many builds)
-            # Your mux_class output showed scan_state enum including PEND.
-            if "scan_state" in conf:
+            # Disable mux EPG scan if supported
+            # epg_prop = self._find_prop(mux_class, id_contains=("epg",), caption_contains=("epg", "scan"))
+            # if epg_prop:
+            #     key = self._enum_key_for_label(epg_prop, "disable")
+            #     conf[epg_prop["id"]] = 0 if key is None else key
+
+            # Queue scan if supported
+            if "scan_state" in prop_ids:
                 conf["scan_state"] = 1
 
             resp = self._post(
                 "/api/mpegts/network/mux_create",
                 data={"uuid": net_uuid, "conf": json_dumps(conf)},
             )
-
             if resp.status_code != 200:
                 self.log.err(f"mux_create failed: {resp.status_code} {resp.text} conf={conf}")
                 return False
-
             return True
 
-        except requests.exceptions.RequestException as e:
-            self.log.err(f"create_mux_atsc request failed: {e}")
-            return False
-        except ValueError as e:
-            self.log.err(f"create_mux_atsc parse failed: {e}")
+        except Exception as e:
+            self.log.err(f"create_mux_atsc failed: {e}")
             return False
 
     def force_scan_mux(self, mux_uuid: str) -> bool:
@@ -419,39 +760,155 @@ class TVHeadendScanner:
             self.log.err(f"force_scan_mux failed for mux_uuid {mux_uuid}: {e}")
             pass
 
-        # Fallback: set scan_state via idnode/save (node= JSON)
-        if self.idnode_save({"uuid": mux_uuid, "scan_state": "PENDING"}):
-            return True
-
-        # Last fallback: numeric scan_state
         return self.idnode_save({"uuid": mux_uuid, "scan_state": "1"})
 
     def count_mux_states(self, net_uuid: str) -> MuxStates:
-        """Count mux states for the network."""
-        response = self._get("/api/mpegts/mux/grid?limit=99999")
-        data = response.json()
+        resp = self._get("/api/mpegts/mux/grid?limit=99999")
+        data = resp.json()
 
         states = MuxStates()
-        for entry in data.get("entries", []):
-            network = entry.get("network_uuid") or entry.get("network")
+
+        for e in data.get("entries", []):
+            network = e.get("network_uuid") or e.get("network")
             if network != net_uuid:
                 continue
 
             states.total += 1
-            scan_state = entry.get("scan_state") or entry.get("scan_status", "UNKNOWN")
 
-            if scan_state == "ACTIVE":
-                states.active += 1
-            elif scan_state == "PENDING":
-                states.pending += 1
-            elif scan_state == "OK":
-                states.ok += 1
-            elif scan_state == "FAIL":
-                states.fail += 1
-            elif scan_state == "IDLE":
-                states.idle += 1
+            scan_state = e.get("scan_state")
+            scan_result = e.get("scan_result")
+
+            # --- scan_state ---
+            # Your build uses ints (we saw 1). Common TVH mapping:
+            # 0=IDLE, 1=PEND, 2=ACTIVE (sometimes 3=...) — we treat nonzero as "in progress".
+            if isinstance(scan_state, int):
+                if scan_state == 0:
+                    states.idle += 1
+                elif scan_state == 1:
+                    states.pending += 1
+                else:
+                    states.active += 1
+            else:
+                # string fallback
+                if scan_state == "ACTIVE":
+                    states.active += 1
+                elif scan_state == "PENDING":
+                    states.pending += 1
+                elif scan_state == "IDLE":
+                    states.idle += 1
+
+            # --- scan_result ---
+            # Your build also has scan_result int (we saw 0).
+            # Treat 0 as NONE/unknown, 1 as OK, 2 as FAIL (common pattern).
+            if isinstance(scan_result, int):
+                if scan_result == 1:
+                    states.ok += 1
+                elif scan_result == 2:
+                    states.fail += 1
+            else:
+                # string fallback
+                if scan_result == "OK":
+                    states.ok += 1
+                elif scan_result == "FAIL":
+                    states.fail += 1
 
         return states
+
+    def get_mpegts_service_grid(self, limit: int = 99999) -> List[dict]:
+        try:
+            data = self._get_json(f"/api/mpegts/service/grid?limit={limit}")
+            entries = data.get("entries") or []
+            return entries if isinstance(entries, list) else []
+        except Exception as e:
+            self.log.err(f"get_mpegts_service_grid: {e}")
+            return []
+
+    def build_service_index(self) -> dict[str, dict]:
+        """
+        Returns {service_uuid: service_entry} from mpegts/service/grid.
+        """
+        out: dict[str, dict] = {}
+        for s in self.get_mpegts_service_grid():
+            su = s.get("uuid") or s.get("id")
+            if isinstance(su, str) and su:
+                out[su] = s
+        return out
+
+    def get_service_to_mux_map(self) -> dict[str, str]:
+        """
+        Prefer mpegts/service/grid because it reliably includes multiplex_uuid in your build.
+        """
+        out: dict[str, str] = {}
+        for s in self.get_mpegts_service_grid():
+            su = s.get("uuid") or s.get("id")
+            if not isinstance(su, str) or not su:
+                continue
+            mux_uuid = s.get("multiplex_uuid") or s.get("mux_uuid")
+            if isinstance(mux_uuid, str) and mux_uuid:
+                out[su] = mux_uuid
+        return out
+
+    def get_service_best_name(self, service_entry: dict) -> Optional[str]:
+        """
+        Improve: in your build, mpegts/service/grid has 'svcname' directly.
+        Fall back to idnode/load only if needed.
+        """
+        v = service_entry.get("svcname")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        v = service_entry.get("name")
+        if isinstance(v, str) and v.strip():
+            s = v.strip()
+            if "/" in s:
+                tail = s.split("/")[-1].strip()
+                if tail:
+                    return tail
+            return s
+
+        su = service_entry.get("uuid") or service_entry.get("id")
+        if isinstance(su, str) and su:
+            return self._service_name_from_idnode(su)
+
+        return None
+
+    def get_service_name(self, service_entry: dict) -> Optional[str]:
+        # First try lightweight list fields
+        v = self._service_param(service_entry, "svcname")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        # Some builds put something usable in "name"
+        v = service_entry.get("name")
+        if isinstance(v, str) and v.strip():
+            # Often "ATSC OTA/569MHz/KQED-HD" — take the tail
+            s = v.strip()
+            if "/" in s:
+                s2 = s.split("/")[-1].strip()
+                if s2:
+                    return s2
+            return s
+
+        # Fall back to authoritative idnode/load
+        su = service_entry.get("uuid") or service_entry.get("id")
+        if not isinstance(su, str) or not su:
+            return None
+
+        ent = self._idnode_load_entry(su)
+        if not ent:
+            return None
+
+        params_map = self._idnode_params_to_map(ent)
+        v = params_map.get("svcname")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        # last resort
+        v = params_map.get("name")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+        return None
 
     def list_services(self, limit: int = 99999) -> List[dict]:
         """
@@ -471,7 +928,69 @@ class TVHeadendScanner:
             self.log.err(f"list_services: {e}")
             return []
 
-    def list_channels(self, limit: int = 99999) -> List[dict]:
+    def delete_orphan_channels(self) -> int:
+        deleted = 0
+        for ch in self.get_channel_grid():
+            services = ch.get("services") or []
+            if not isinstance(services, list):
+                services = []
+            if len(services) == 0:
+                uuid = ch.get("uuid")
+                name = ch.get("name") or ""
+                if isinstance(uuid, str) and uuid:
+                    if self.config.dry_run:
+                        self.log.out(f"[dry-run] Would delete orphan channel: {name} uuid={uuid}")
+                        deleted += 1
+                    else:
+                        self.log.out(f"Deleting orphan channel: {name} uuid={uuid}")
+                        if self.delete_channel_uuid(uuid):
+                            deleted += 1
+        return deleted
+
+    def get_playlist_channels(self) -> List[Channel]:
+        """
+        tvheadend's /playlist/channels returns an m3u file.
+        Lines look like:
+
+            #EXTINF:-1 tvg-id="26e30b9fb6fb20429aac61784fb50ed4" tvg-chno="9.1",KQED-HD
+            http://localhost:9981/stream/channelid/520872742?profile=pass
+        """
+        try:
+            resp = self._get("/playlist/channels")
+        except requests.exceptions.RequestException as e:
+            self.log.err(f"get_playlist_channels: {e}")
+            return []
+        except ValueError as e:
+            self.log.err(f"get_playlist_channels: {e}")
+            return []
+
+        channels = []
+        name = None
+
+        for line in resp.text.splitlines():
+            print(f"Processing /playlist/channels line {line}")
+
+            if not line.strip():
+                continue
+
+            if line.startswith('#EXTM3U'):
+                continue
+
+            elif line.startswith('#EXTINF'):
+                name = line.strip().split(',')[-1].strip()
+
+            elif line.startswith('http://'):
+                if name is None:
+                    raise ValueError(f"No name found before url: {line}")
+                channels.append(Channel(name, line))
+                name = None
+
+            else:
+                raise ValueError(f"Unexpected m3u line: {line}")
+
+        return channels
+
+    def get_channel_grid(self, limit: int = 99999) -> List[dict]:
         """
         List all channels in the admin view.
         """
@@ -480,10 +999,10 @@ class TVHeadendScanner:
             data = resp.json()
             return data.get("entries", [])
         except requests.exceptions.RequestException as e:
-            self.log.err(f"list_channels: {e}")
+            self.log.err(f"get_channel_grid: {e}")
             return []
         except ValueError as e:
-            self.log.err(f"list_channels: {e}")
+            self.log.err(f"get_channel_grid: {e}")
             return []
 
     def create_channel(self, name: str, service_uuid: str) -> bool:
@@ -549,50 +1068,60 @@ class TVHeadendScanner:
             self.log.err(f"delete_channel_uuid: {e}")
             return False
 
-    def ensure_channels_mapped_from_services(self) -> tuple[int, int]:
+    def ensure_channels_mapped_from_services(self) -> tuple[int, int, int]:
         """
-        Create channels for services that are not attached to any channel.
-
-        Returns:
-            (created_count, already_mapped_count)
+        Create channels for services not yet referenced by any channel.
+        Returns (created, skipped_already_mapped, skipped_no_name)
         """
         services = self.list_services()
-        channels = self.list_channels()
+        channels = self.get_channel_grid()
 
-        # Collect a set of service UUIDs already referenced by channels.
         mapped_services: set[str] = set()
         for ch in channels:
-            for service in (ch.get("services") or []):
-                if isinstance(service, str):
-                    mapped_services.add(service)
+            for su in (ch.get("services") or []):
+                if isinstance(su, str) and su:
+                    mapped_services.add(su)
 
         created = 0
-        skipped = 0
+        skipped_mapped = 0
+        skipped_no_name = 0
 
-        for service in services:
-            service_uuid = service.get("uuid") or service.get("id")
-            if not service_uuid or not isinstance(service_uuid, str):
+        for svc in services:
+            service_uuid = svc.get("uuid") or svc.get("id")
+            if not isinstance(service_uuid, str) or not service_uuid:
                 continue
 
             if service_uuid in mapped_services:
-                skipped += 1
+                skipped_mapped += 1
                 continue
 
-            # Try common name fields across tvheadend builds.
-            name = self._service_param(service, "svcname") or service.get("name") or service.get("text")
-
-            if not name or not isinstance(name, str):
-                # If TVH didn't provide a name yet, don't create a junk channel;
-                # it can appear later after tuning/PSIP.
-                self.log.out(f"Skipping service without name: {service}")
+            name = self.get_service_best_name(svc)
+            if not name:
+                skipped_no_name += 1
+                self.log.out(f"Skipping service without name: uuid={service_uuid}")
                 continue
 
-            name = name.strip()
+            conf = {
+                "enabled": True,
+                "name": name,
+                "autoname": True,
+                "epgauto": True,
+                "services": [service_uuid],
+            }
 
-            if self.create_channel(name=name, service_uuid=service_uuid):
+            if self.config.dry_run:
+                self.log.out(f"[dry-run] Would create channel: {name} <- {service_uuid}")
                 created += 1
+                continue
 
-        return created, skipped
+            resp = self._post("/api/channel/create", data={"conf": json_dumps(conf)})
+            if resp.status_code == 200:
+                created += 1
+            else:
+                self.log.err(
+                    f"channel/create failed for service {service_uuid} name={name!r}: {resp.status_code} {resp.text}")
+
+        return created, skipped_mapped, skipped_no_name
 
     def cleanup_unnamed_channels(self) -> int:
         """
@@ -607,10 +1136,13 @@ class TVHeadendScanner:
         unnamed_markers.add("")  # always treat blank as unnamed
 
         deleted = 0
-        for ch in self.list_channels():
+        for ch in self.get_channel_grid():
             name = (ch.get("name") or "")
             if not isinstance(name, str):
                 name = ""
+            # Delete channels that have placeholder or empty names.
+            # Skipping the check for autoname and epgauto because humans can't
+            # create channels on this device.
             if name.strip() in unnamed_markers:
                 uuid = ch.get("uuid")
                 if uuid and isinstance(uuid, str):
@@ -618,97 +1150,264 @@ class TVHeadendScanner:
                         deleted += 1
         return deleted
 
-    def deduplicate_channels_by_name_prefer_low_major(self) -> dict:
+    def is_channel_streamable(self, ch: dict, *, seconds: float = 1.5) -> bool:
         """
-        Deduplicate channels that share the same name by keeping the lowest major number (e.g. 9.x)
-        and merging services onto it.
-
-        Safe for appliance-managed channels: you can optionally restrict to autoname+epgauto.
+        Quick probe: try GET /stream/channelid/<chid>?profile=pass
+        and see if we get HTTP 200 and at least some bytes.
+        This will allocate a tuner briefly, so keep it short.
         """
-        channels = self.list_channels()
+        chid = self._channel_stream_id(ch)
+        if not chid:
+            return False
 
-        # Group channels by name (ignore blanks and name-not-set)
+        url = f"{self.config.base_url}/stream/channelid/{chid}"
+        params = {"profile": "pass"}
+
+        try:
+            with requests.get(url, params=params, auth=self.auth, stream=True, timeout=seconds) as r:
+                if r.status_code != 200:
+                    return False
+                # Pull a small chunk; black channel usually still returns TS,
+                # but your failing case often never starts (no adapters) => non-200 or no data.
+                it = r.iter_content(chunk_size=188 * 10)
+                chunk = next(it, b"")
+                return bool(chunk)
+        except Exception:
+            return False
+
+    def deduplicate_channels_by_name(self, net_uuid: str) -> dict:
+        """
+        Deduplicate channels sharing the same name.
+        Canonical selection prefers:
+          1) most services on muxes that are enabled+OK in this network
+          2) streamable (optional probe) as tie-breaker
+          3) enabled
+          4) lowest (major, minor)
+          5) most total services
+        Then merges all services onto canonical and deletes the rest.
+        """
+        channels = self.get_channel_grid()
+
+        mux_health = self.get_mux_health_for_network(net_uuid)
+        good_muxes = {m for (m, info) in mux_health.items() if self._mux_is_ok(info)}
+        svc_to_mux = self.get_service_to_mux_map()
+
+        # Group by name
         groups: dict[str, list[dict]] = {}
         for ch in channels:
             name = ch.get("name")
             if not isinstance(name, str):
-                self.log.out(f"Skipping channel {ch['uuid']}. Name is not a string.")
                 continue
             name = name.strip()
             if not name or name == "{name-not-set}":
-                self.log.out(f"Skipping channel {ch['uuid']}. Name is '{name}'.")
                 continue
-
-            # Safety check.
-            if ch.get("autoname") is not True or ch.get("epgauto") is not True:
-                continue
-
             groups.setdefault(name, []).append(ch)
 
         merged_groups = 0
         updated_channels = 0
         deleted_channels = 0
+        stream_probes = 0
 
         for name, chans in groups.items():
             if len(chans) < 2:
-                self.log.out(f"Only one channel in group '{name}'. Nothing to de-duplicate.")
                 continue
 
-            # Choose canonical: lowest major, then lowest minor, then keep enabled, then most services
-            def score(_ch: dict):
-                mm = self._parse_major_minor(_ch.get("number"))
-                major, minor = mm if mm else (9999, 9999)
-                enabled = bool(_ch.get("enabled"))
-                svc_count = len(_ch.get("services") or [])
-                # lower major/minor preferred => sort ascending for those, so use them directly
-                # enabled preferred => sort descending, so negate enabled
-                return major, minor, -int(enabled), -svc_count
+            def good_service_count(_ch: dict) -> int:
+                cnt = 0
+                for su in (_ch.get("services") or []):
+                    if isinstance(su, str) and su:
+                        mux_uuid = svc_to_mux.get(su)
+                        if mux_uuid and mux_uuid in good_muxes:
+                            cnt += 1
+                return cnt
 
-            chans_sorted = sorted(chans, key=score)
-            canonical = chans_sorted[0]
+            # Precompute candidate features
+            enriched = []
+            for ch in chans:
+                mm = self._parse_major_minor(ch.get("number")) or (9999, 9999)
+                gsc = good_service_count(ch)
+                enabled = bool(ch.get("enabled"))
+                svc_count = len(ch.get("services") or [])
+                enriched.append((ch, gsc, enabled, mm[0], mm[1], svc_count))
+
+            # Sort by viability-first (descending gsc), then enabled, then lowest major/minor, then most services
+            enriched.sort(key=lambda t: (-t[1], -int(t[2]), t[3], t[4], -t[5]))
+
+            # If top two are close / tied on viability, probe streamability
+            canonical = enriched[0][0]
+            if len(enriched) >= 2:
+                a = enriched[0]
+                b = enriched[1]
+                # Only probe when viability doesn't clearly decide it
+                if a[1] == b[1]:
+                    # Probe just these two (cheap)
+                    if not self.config.dry_run:
+                        stream_probes += 2
+                        a_ok = self.is_channel_streamable(a[0])
+                        b_ok = self.is_channel_streamable(b[0])
+                        if b_ok and not a_ok:
+                            canonical = b[0]
+
             canon_uuid = canonical.get("uuid")
             if not isinstance(canon_uuid, str) or not canon_uuid:
                 continue
 
-            # Merge all services into canonical
+            # Merge services (stable order)
             merged_services: list[str] = []
             seen: set[str] = set()
-
-            for ch in chans_sorted:
+            for ch in [t[0] for t in enriched]:
                 for su in (ch.get("services") or []):
                     if isinstance(su, str) and su and su not in seen:
                         seen.add(su)
                         merged_services.append(su)
 
-            # Save canonical with merged services list
-            ok = self.idnode_save_params(
-                uuid=canon_uuid,
-                cls="channel",  # We know this is correct for this function.
-                changes={"services": merged_services}
-            )
-            if not ok:
-                continue
+            # Use class autodetect, not hardcoded "channel"
+            canon_ent = self._idnode_load_entry(canon_uuid)
+            canon_cls = canon_ent.get("class") if canon_ent else None
 
-            updated_channels += 1
+            if self.config.dry_run:
+                self.log.out(
+                    f"[dry-run] Would set canonical services for '{name}' uuid={canon_uuid} services={merged_services}")
+                updated_channels += 1
+            else:
+                ok = self.idnode_save_params(
+                    uuid=canon_uuid,
+                    cls=canon_cls,
+                    changes={"services": merged_services},
+                )
+                if not ok:
+                    self.log.err(f"Failed to merge services onto canonical for '{name}' uuid={canon_uuid}")
+                    continue
+                updated_channels += 1
 
-            # Delete all non-canonical channels
-            for ch in chans_sorted[1:]:
-                uuid = ch.get("uuid")
-                if isinstance(uuid, str) and uuid:
-                    if self.delete_channel_uuid(uuid):
+            # Delete non-canonical channels
+            for ch in [t[0] for t in enriched]:
+                u = ch.get("uuid")
+                if u == canon_uuid:
+                    continue
+                if isinstance(u, str) and u:
+                    if self.config.dry_run:
+                        self.log.out(f"[dry-run] Would delete duplicate channel '{name}' uuid={u}")
                         deleted_channels += 1
+                    else:
+                        if self.delete_channel_uuid(u):
+                            deleted_channels += 1
 
             merged_groups += 1
 
-        self.log.out(f"dedupe: merged {merged_groups} groups, " +
-                     f"updated {updated_channels} canonical channels, " +
-                     f"deleted {deleted_channels} non-canonical channels.")
-
+        self.log.out(
+            f"dedupe: merged_groups={merged_groups}, updated_channels={updated_channels}, "
+            f"deleted_channels={deleted_channels}, stream_probes={stream_probes}"
+        )
         return {
             "merged_groups": merged_groups,
             "updated_channels": updated_channels,
             "deleted_channels": deleted_channels,
+            "stream_probes": stream_probes,
         }
+
+    def prune_invalid_services_per_channel(
+            self,
+            net_uuid: str,
+            *,
+            drop_services_without_name: bool = True,
+            delete_empty_channels: bool = True,
+            settle_delay: float = 0.4,
+    ) -> dict:
+        """
+        Final safety net:
+          - remove channel services whose mux is not enabled or scan_result != OK
+          - remove services not in this network
+          - optionally drop unnamed/ghost services (svcname null)
+          - delete channels that end up with no services
+        """
+        good_muxes = self.get_good_muxes(net_uuid)
+        svc_index = self.build_service_index()  # service_uuid -> entry
+        svc_to_mux = self.get_service_to_mux_map()  # service_uuid -> mux_uuid
+
+        channels = self.get_channel_grid()
+        updated = 0
+        deleted = 0
+        removed_links = 0
+        skipped = 0
+
+        for ch in channels:
+            cu = ch.get("uuid")
+            if not isinstance(cu, str) or not cu:
+                continue
+
+            services = ch.get("services") or []
+            if not isinstance(services, list):
+                services = []
+
+            # Keep only those mapped to a good mux
+            kept: List[str] = []
+            seen: Set[str] = set()
+
+            for su in services:
+                if not isinstance(su, str) or not su:
+                    continue
+                if su in seen:
+                    continue
+                seen.add(su)
+
+                mux_uuid = svc_to_mux.get(su)
+                if not mux_uuid or mux_uuid not in good_muxes:
+                    removed_links += 1
+                    continue
+
+                if drop_services_without_name:
+                    s = svc_index.get(su)
+                    svcname = s.get("svcname") if isinstance(s, dict) else None
+                    if not (isinstance(svcname, str) and svcname.strip()):
+                        # This is exactly your earlier “sid-only” ghost pattern.
+                        removed_links += 1
+                        continue
+
+                kept.append(su)
+
+            if kept == services:
+                skipped += 1
+                continue
+
+            if not kept and delete_empty_channels:
+                if self.config.dry_run:
+                    self.log.out(
+                        f"[dry-run] Would delete channel with no valid services: uuid={cu} name={ch.get('name')!r}")
+                    deleted += 1
+                else:
+                    if self.delete_channel_uuid(cu):
+                        deleted += 1
+                        time.sleep(settle_delay)
+                continue
+
+            # Update channel->services
+            ent = self._idnode_load_entry(cu)
+            cls = ent.get("class") if ent else None
+
+            if self.config.dry_run:
+                self.log.out(
+                    f"[dry-run] Would prune channel uuid={cu} name={ch.get('name')!r} services={services} -> {kept}")
+                updated += 1
+                continue
+
+            ok = self.idnode_save_params(uuid=cu, cls=cls, changes={"services": kept})
+            if ok:
+                updated += 1
+                time.sleep(settle_delay)
+            else:
+                self.log.err(f"Failed to prune services for channel uuid={cu} name={ch.get('name')!r}")
+
+        stats = {
+            "channels_total": len(channels),
+            "channels_updated": updated,
+            "channels_deleted": deleted,
+            "service_links_removed": removed_links,
+            "channels_skipped": skipped,
+            "good_muxes": len(good_muxes),
+        }
+        self.log.out(f"prune_invalid_services_per_channel: {stats}")
+        return stats
 
     def scan(self, progress_callback: Optional[Callable[[str, MuxStates], None]] = None) -> bool:
         """
@@ -729,6 +1428,8 @@ class TVHeadendScanner:
             else:
                 self.log.out(msg)
 
+        self.set_epg_grabbers_enabled(enabled=False)
+
         # Step 1: Find network
         log(f"Finding network UUID for: {self.config.net_name}")
         net_uuid = self.get_network_uuid()
@@ -736,6 +1437,10 @@ class TVHeadendScanner:
             log(f"Network not found: {self.config.net_name}")
             return False
         log(f"Network UUID: {net_uuid}")
+
+        log("Ensuring ATSC-T frontends are enabled and linked to network...")
+        stats = self.ensure_atsc_t_frontends_enabled_and_linked(net_uuid)
+        log(f"Frontend config: {stats}")
 
         # Step 2: Optionally wipe existing muxes
         if self.config.wipe_existing_muxes:
@@ -774,6 +1479,8 @@ class TVHeadendScanner:
         # Step 5: Poll until settled
         log(f"Polling scan progress (timeout {self.config.timeout_secs}s)...")
         start_time = time.time()
+        states = self.count_mux_states(net_uuid)
+        log(f"Waiting for scan to settle. {states}.")
         while True:
             elapsed = time.time() - start_time
             if elapsed > self.config.timeout_secs:
@@ -786,25 +1493,57 @@ class TVHeadendScanner:
             log(str(states), states)
 
             if states.is_settled():
+                self.log.out("Scan settled.")
                 break
 
+            log(f"Waiting for scan to settle. {elapsed:.1f}s elapsed. {states}.")
             time.sleep(self.config.sleep_secs)
 
         # Step 6: Start service mapping
-        log("Scan settled.")
-        if self.config.map_services_to_channels:
-            log("Mapping services to channels (deterministic)...")
-            created, skipped = self.ensure_channels_mapped_from_services()
-            log(f"Service → channel reconciliation: created={created}, already_mapped={skipped}")
+        # In order:
+        # - Delete orphan channels (no services attached)
+        # - Map services → channels
+        # - Delete unnamed / junk channels
+        # - Deduplicate channels
+        # - (Optional) renumber / sort
 
+        # After wiping muxes or rescanning, TVH leaves behind channels with: "services": [].
+        # These cannot stream or get services again, and they will confuse de-duplication.
+        log("Deleting orphan channels...")
+        deleted = self.delete_orphan_channels()
+        log(f"Deleted {deleted} orphan channels.")
+
+        # At this point, services are authoritative, channel names come from svcname,
+        # and channels have valid services. So we can now map services to channels.
+        log("Mapping services -> channels (deterministic)...")
+        created, skipped_mapped, skipped_no_name = self.ensure_channels_mapped_from_services()
+        log(f"Mapping results: created={created}, already_mapped={skipped_mapped}, no_name={skipped_no_name}")
+
+        # Some channels have names like '{name-not-set}' or ''. They're partially broken objects
+        # or maybe garbage from previous scans. They're useless, so delete them now that we've
+        # completed the service mapping.
         if self.config.delete_unnamed_channels:
             log("Cleaning up unnamed channels...")
             deleted = self.cleanup_unnamed_channels()
             log(f"Deleted {deleted} unnamed channels.")
 
-        log("Deduplicating channels (prefer low major, merge services, delete dup channels)...")
-        dedup_stats = self.deduplicate_channels_by_name_prefer_low_major()
+        # Deduplicate channels by name, preferring the one with the lowest major number.
+        log("Deduplicating channels...")
+        dedup_stats = self.deduplicate_channels_by_name(net_uuid)
         log(f"Dedup stats: {dedup_stats}")
+
+        time.sleep(1)  # Let tuners and table decoding settle.
+
+        log("Pruning invalid services per channel (final safety net)...")
+        prune_stats = self.prune_invalid_services_per_channel(
+            net_uuid,
+            drop_services_without_name=True,
+            delete_empty_channels=True,
+            settle_delay=0.4,
+        )
+        log(f"Prune stats: {prune_stats}")
+
+        time.sleep(1)  # Reduce "immediate retune after write" flakiness.
 
         log("Done with scan.")
 

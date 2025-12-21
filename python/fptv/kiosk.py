@@ -14,8 +14,8 @@ import pygame
 from event import Event
 from hw import setup_encoder
 from mpv import MPV
+from tvh import Channel, ScanConfig, TVHeadendScanner
 from render import draw_menu, draw_browse, draw_playing
-from channels import get_channels, Channel
 from x11 import blanking_disable, blanking_enable, ui_show, ui_hide, mpv_raise, mpv_lower
 
 FPTV_CAPTION = 'fptv'
@@ -48,6 +48,7 @@ class FPTV:
     def __init__(self):
         self.running = False
         self.mpv = MPV()
+        self.tvh = TVHeadendScanner(ScanConfig.from_env())
         self.eventQueue: SimpleQueue[Event] = SimpleQueue()
         self.blanking_is_disabled = False
 
@@ -85,7 +86,7 @@ class FPTV:
         clock = pygame.time.Clock()
 
         # Model
-        state = State(channels=get_channels())
+        state = State(channels=self.tvh.get_playlist_channels())
 
         self.mpv.spawn()
         time.sleep(1)
@@ -194,7 +195,7 @@ class FPTV:
 
             elif state.screen == Screen.SCAN:
                 draw_menu(surface, self.font_title, self.font_item,
-                          "Scan", ["(not implemented)", "Press to go back"], 1)
+                          ["(not implemented)", "Press to go back"], 1)
 
             elif state.screen == Screen.SHUTDOWN:
                 # Hack
