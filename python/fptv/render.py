@@ -14,12 +14,17 @@ FG_INACT = (180, 180, 180)
 FG_ACT = (0, 0, 0)
 BG_INACT = (0, 0, 0)
 BG_ACT = (90, 105, 255)
+FG_ALERT = (255, 40, 40)
 
 
-def draw_menu(surface, title_font, item_font, title: str,
+def draw_menu(surface, title_font, item_font,
               items: List[str], selected: int):
     surface.fill((0, 0, 0))
-    draw_centered_text(surface, title_font, title, 90)
+    text_fp = title_font.render("FP", True, BG_SEL)
+    text_tv = title_font.render("TV", True, FG_NORM)
+    x, y = 60, 60
+    surface.blit(text_fp, (x, y))
+    surface.blit(text_tv, (x + text_fp.get_width(), y))
 
     start_y = 200
     line_h = 70
@@ -27,52 +32,50 @@ def draw_menu(surface, title_font, item_font, title: str,
 
     for i, text in enumerate(items):
         is_sel = (i == selected)
-        # prefix = "▶ " if is_sel else "  "
-        prefix = "  "
         bg_color = BG_SEL if is_sel else BG_NORM
         fg_color = FG_SEL if is_sel else FG_NORM
 
         y = start_y + i * line_h
-        rect = pygame.Rect(0, y, line_w, line_h)
+        rect = pygame.Rect(x, y, line_w, line_h)
         pygame.draw.rect(surface, bg_color, rect)
 
-        text_surf = item_font.render(prefix + text, True, fg_color)
+        text_surf = item_font.render(text, True, fg_color)
         text_rect = text_surf.get_rect()
-        text_rect.midleft = (20, y + line_h // 2)
+        text_rect.midleft = (x, y + line_h // 2)
 
         surface.blit(text_surf, text_rect)
 
 
-def draw_browse(surface, title_font, item_font, small_font,
+def draw_browse(surface, item_font,
                 channels: List[Channel], selected: int):
     surface.fill(BG_NORM)
-    # Header with Back "affordance"
     header = "Back"
-    img = small_font.render(header, True, FG_INACT, BG_INACT)
-    surface.blit(img, (20, 20))
+    fg_color = BG_SEL if selected == -1 else FG_NORM
+    bg_color = BG_NORM
 
-    draw_centered_text(surface, title_font, "Browse", 70)
+    img = item_font.render(header, True, fg_color, bg_color)
+    surface.blit(img, (20, 0))
 
     if not channels:
         draw_centered_text(
-            surface, item_font, "No channels", surface.get_height() // 2)
+            surface, item_font, "No channels", surface.get_height() // 2,
+            color=FG_ALERT)
         return
 
     # Show a window around selection
     h = surface.get_height()
-    visible = max(5, (h - 200) // 52)
+    visible = max(5, (h - 148) // 52)
     half = visible // 2
     start = max(0, selected - half)
     end = min(len(channels), start + visible)
     start = max(0, end - visible)
 
-    y0 = 150
+    y0 = 130
     line_h = 52
     line_w = surface.get_width()
     for row, idx in enumerate(range(start, end)):
         text = channels[idx].name
         is_sel = (idx == selected)
-        # prefix = "▶ " if is_sel else "  "
         prefix = "  "
         fg_color = FG_SEL if is_sel else FG_NORM
         bg_color = BG_SEL if is_sel else BG_NORM
@@ -84,11 +87,6 @@ def draw_browse(surface, title_font, item_font, small_font,
         text_rect.midleft = (20, y + line_h // 2)
         surface.blit(text_surf, text_rect)
 
-    # Footer hint
-    hint = "Rotate: scroll    Press: select/stop"
-    img = small_font.render(hint, True, FG_INACT)
-    surface.blit(img, (20, surface.get_height() - 40))
-
 
 def draw_playing(surface, title_font, item_font, small_font, name: str):
     surface.fill((0, 0, 0))
@@ -98,8 +96,7 @@ def draw_playing(surface, title_font, item_font, small_font, name: str):
     draw_centered_text(surface, item_font, name, 190)
 
 
-def draw_centered_text(surface, font, text, y, bold=False):
-    color = (255, 255, 255)
+def draw_centered_text(surface, font, text, y, bold=False, color=FG_NORM):
     img = font.render(text, True, color)
     r = img.get_rect(center=(surface.get_width() // 2, y))
     surface.blit(img, r)

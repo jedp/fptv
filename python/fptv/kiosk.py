@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
@@ -60,7 +61,7 @@ class FPTV:
         pygame.font.init()
         pygame.mouse.set_visible(False)
 
-        self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 92)
+        self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSeBd.ttf", 92)
         self.font_item = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
         self.font_small = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 32)
 
@@ -86,6 +87,7 @@ class FPTV:
         state = State(channels=get_channels())
 
         self.mpv.spawn()
+        time.sleep(1)
         ui_show(ui_xid)
 
         # Keyboard support for development (optional)
@@ -118,15 +120,13 @@ class FPTV:
                         break
 
                     if ev == Event.ROT_R or ev == Event.ROT_L:
-                        print("Event: {ev}")
                         delta = 1 if ev == Event.ROT_R else -1
                         if state.screen == Screen.MAIN:
-                            state.main_index = max(0, min(2, state.main_index + delta))
+                            state.main_index = max(-1, min(2, state.main_index + delta))
                         elif state.screen == Screen.BROWSE and state.channels:
-                            state.browse_index = max(0, min(len(state.channels) - 1, state.browse_index + delta))
+                            state.browse_index = max(-1, min(len(state.channels) - 1, state.browse_index + delta))
 
                     elif ev == Event.PRESS:
-                        print("Event: {ev}")
                         if state.screen == Screen.MAIN:
                             if state.main_index == 0:  # Browse
                                 state.screen = Screen.BROWSE
@@ -141,6 +141,13 @@ class FPTV:
                         elif state.screen == Screen.BROWSE:
                             if not state.channels:
                                 continue
+
+                            # Back button.
+                            if state.browse_index == -1:
+                                state.browse_index = 0
+                                state.screen = Screen.MAIN
+                                continue
+
                             ch = state.channels[state.browse_index]
                             state.playing_name = ch.name
                             state.screen = Screen.PLAYING
@@ -167,14 +174,14 @@ class FPTV:
             # Render current screen
             if state.screen == Screen.MAIN:
                 draw_menu(surface, self.font_title, self.font_item,
-                          "FPTV", ["Browse", "Scan", "Shutdown"], state.main_index)
+                          ["Browse", "Scan", "Shutdown"], state.main_index)
 
             elif state.screen == Screen.SCAN:
                 draw_menu(surface, self.font_title, self.font_item,
                           "Scan", ["(not implemented)", "Press to go back"], 1)
 
             elif state.screen == Screen.BROWSE:
-                draw_browse(surface, self.font_title, self.font_item, self.font_small,
+                draw_browse(surface, self.font_item,
                             state.channels, state.browse_index)
 
             elif state.screen == Screen.PLAYING:
