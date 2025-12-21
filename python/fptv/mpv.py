@@ -64,7 +64,6 @@ class MPV:
 
         print(f"mpv pid: {self.proc.pid}")
         rc = self.proc.poll()
-        print(f"mpv poll: {rc}")
         if rc is not None:
             out, err = self.proc.communicate(timeout=0.2)
             print(f"mpv stdout: {out}")
@@ -104,20 +103,26 @@ class MPV:
         self._cmd(["set_property", "vid", "no"])
 
     def shutdown(self) -> None:
+        print("mpv: Begin shutdown")
         if not self.proc:
+            print("mpv: No process. Nothing to shut down.")
             return
 
         if self.proc.poll() is not None:
+            print("mpv: Nothing to shut down.")
             self.proc = None
             return
 
         # Try to shutdown nicely.
+        print("mpv: Trying to shut down nicely.")
         if not self._cmd(["quit"]):
+            print("mpv: Trying harder to shut down.")
             self.proc.terminate()
 
         try:
             self.proc.wait(timeout=2)
         except Exception:
+            print("mpv: Killing process.")
             self.proc.kill()
         finally:
             self.proc = None

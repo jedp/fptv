@@ -28,6 +28,7 @@ class Screen(Enum):
     BROWSE = auto()
     PLAYING = auto()
     SCAN = auto()  # placeholder
+    SHUTDOWN = auto()
 
 
 @dataclass
@@ -125,6 +126,9 @@ class FPTV:
                             state.main_index = max(-1, min(2, state.main_index + delta))
                         elif state.screen == Screen.BROWSE and state.channels:
                             state.browse_index = max(-1, min(len(state.channels) - 1, state.browse_index + delta))
+                        elif state.screen == Screen.SHUTDOWN:
+                            # Only two options: Cancel and Shutdown.
+                            state.browse_index = max(-1, min(1, state.browse_index + delta))
 
                     elif ev == Event.PRESS:
                         if state.screen == Screen.MAIN:
@@ -132,8 +136,10 @@ class FPTV:
                                 state.screen = Screen.BROWSE
                             elif state.main_index == 1:  # Scan (placeholder)
                                 state.screen = Screen.SCAN
-                            else:  # Shutdown (for now: exit)
-                                self.running = False
+                            elif state.main_index == 2:  # Shutdown
+                                state.screen = Screen.SHUTDOWN
+                            else:
+                                raise ValueError(f"Unhandled menu index: {state.main_index}")
 
                         elif state.screen == Screen.SCAN:
                             state.screen = Screen.MAIN
@@ -165,6 +171,16 @@ class FPTV:
                             state.screen = Screen.BROWSE
                             print(f"Player done. Mode is browse")
 
+                        elif state.screen == Screen.SHUTDOWN:
+                            if state.browse_index == 1:
+                                # Shutdown option.
+                                self.eventQueue.put(Event.QUIT)
+
+                            # Back or Cancel
+                            else:
+                                state.browse_index = 0
+                                state.screen = Screen.MAIN
+
                     else:
                         raise ValueError(f"Unknown event: {ev}")
 
@@ -179,6 +195,15 @@ class FPTV:
             elif state.screen == Screen.SCAN:
                 draw_menu(surface, self.font_title, self.font_item,
                           "Scan", ["(not implemented)", "Press to go back"], 1)
+
+            elif state.screen == Screen.SHUTDOWN:
+                # Hack
+                options = [
+                        Channel("Cancel", ""),
+                        Channel("Shutdown and Power Off", "")
+                        ]
+                draw_browse(surface, self.font_item,
+                            options, state.browse_index)
 
             elif state.screen == Screen.BROWSE:
                 draw_browse(surface, self.font_item,
@@ -195,13 +220,18 @@ class FPTV:
             pygame.display.flip()
             clock.tick(30)
 
+        self.shutdown()
+
     def shutdown(self) -> int:
         try:
+            print("Shutting down player.")
             self.mpv.shutdown()
             self._set_blanking(False)
+            print("Quitting pygame engine.")
             pygame.quit()
         except Exception as e:
             print(f"Error during shutdown: {e}")
             return 1
 
+        print("Bye!")
         return 0
