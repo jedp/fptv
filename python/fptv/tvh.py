@@ -395,9 +395,8 @@ class TVHeadendScanner:
             if not isinstance(e, dict):
                 continue
 
-            nu = e.get("network_uuid")
-            nn = e.get("network")  # sometimes name, sometimes uuid depending on build
-            if nu != net_uuid and nn not in (net_uuid, self.config.net_name):
+            nu = e.get("network_uuid") or e.get("network")
+            if nu not in (net_uuid, self.config.net_name):
                 continue
 
             mux_uuid = e.get("uuid")
@@ -415,6 +414,46 @@ class TVHeadendScanner:
     def get_good_muxes(self, net_uuid: str) -> Set[str]:
         mux_health = self.get_mux_health_for_network(net_uuid)
         return {m for (m, info) in mux_health.items() if self._mux_is_ok(info)}
+
+    def disable_failed_muxes(self, net_uuid: str) -> dict:
+        """
+        Disable muxes that are enabled but scan_result=FAIL.
+        Keeps them around (so you can re-enable later), but stops TVH from retuning to garbage.
+        """
+        resp = self._get("/api/mpegts/mux/grid?limit=99999")
+        data = resp.json()
+
+        disabled = 0
+        considered = 0
+        errors = 0
+
+        for e in data.get("entries", []):
+            # Be robust across builds: sometimes `network_uuid`, sometimes `network` name
+            net = e.get("network_uuid") or e.get("network")
+            if net != net_uuid and net != self.config.net_name:
+                continue
+
+            mux_uuid = e.get("uuid")
+            if not isinstance(mux_uuid, str) or not mux_uuid:
+                continue
+
+            enabled = bool(e.get("enabled", True))
+            scan_result = e.get("scan_result")
+
+            considered += 1
+
+            # Your build: 1=OK, 2=FAIL
+            is_fail = (scan_result == 2) or (isinstance(scan_result, str) and scan_result.upper() == "FAIL")
+            if enabled and is_fail:
+                ent = self._idnode_load_entry(mux_uuid)
+                cls = ent.get("class") if ent else None
+                ok = self._maybe_save_idnode_params(mux_uuid, cls, {"enabled": False})
+                if ok:
+                    disabled += 1
+                else:
+                    errors += 1
+
+        return {"considered": considered, "disabled": disabled, "errors": errors}
 
     def ensure_atsc_t_frontends_enabled_and_linked(self, net_uuid: str) -> dict:
         """
@@ -680,6 +719,94 @@ class TVHeadendScanner:
         Return the "props" list with ids + defaults for the mux type on that network.
         """
         return self._get("/api/mpegts/network/mux_class", params={"uuid": net_uuid}).json()
+
+    def get_mux_index(self, *, net_uuid: str) -> dict[str, dict]:
+        """
+        Returns mux_uuid -> info for muxes in this network.
+        Matches by either network_uuid==net_uuid OR network name==self.config.net_name
+        to handle builds that only return one or the other.
+        """
+        resp = self._get("/api/mpegts/mux/grid?limit=99999")
+        data = resp.json()
+
+        out: dict[str, dict] = {}
+        for e in (data.get("entries") or []):
+            if not isinstance(e, dict):
+                continue
+
+            net = e.get("network_uuid") or e.get("network")
+            if net not in (net_uuid, self.config.net_name):
+                continue
+
+            mux_uuid = e.get("uuid")
+            if not isinstance(mux_uuid, str) or not mux_uuid:
+                continue
+
+            out[mux_uuid] = {
+                "enabled": bool(e.get("enabled", True)),
+                "scan_result": e.get("scan_result"),
+                "scan_state": e.get("scan_state"),
+                "network_uuid": e.get("network_uuid"),
+                "network": e.get("network"),
+                "frequency": e.get("frequency"),
+            }
+
+        return out
+
+    def get_service_mux_uuid(self, service_uuid: str) -> Optional[str]:
+        # First try service/list cached map if you want; but authoritative is idnode/load:
+        ent = self._idnode_load_entry(service_uuid)
+        if not ent:
+            return None
+        params = self._idnode_params_to_map(ent)
+        v = params.get("multiplex_uuid") or params.get("mux_uuid")
+        return v if isinstance(v, str) and v else None
+
+    def service_is_acceptable(self, service_uuid: str, *, net_uuid: str, mux_index: dict[str, dict]) -> tuple[bool, str]:
+        """
+        Returns (ok, reason_key_if_not_ok).
+        reason_key must match keys in prune stats["reasons"].
+        """
+
+        # Find mux_uuid for this service
+        mux_uuid = None
+
+        # Fast path: sometimes list_services has multiplex_uuid
+        # (If you already have a map cached, use that; this is direct + safe.)
+        ent = self._idnode_load_entry(service_uuid)
+        if ent:
+            params = self._idnode_params_to_map(ent)
+            mux_uuid = params.get("multiplex_uuid") or params.get("mux_uuid")
+
+            # Optional: check service network too (depends on build)
+            svc_net = params.get("network_uuid") or params.get("network")
+            if svc_net is not None and svc_net not in (net_uuid, self.config.net_name):
+                return False, "removed_wrong_network"
+
+        if not isinstance(mux_uuid, str) or not mux_uuid:
+            return False, "removed_service_missing_mux"
+
+        mux = mux_index.get(mux_uuid)
+        if not mux:
+            # This is where your earlier bug would show up as "everything ok"
+            # if you were treating unknown as acceptable.
+            return False, "removed_unknown_mux"
+
+        if not mux.get("enabled", True):
+            return False, "removed_mux_disabled"
+
+        r = mux.get("scan_result")
+        # Your build: 1=OK, 2=FAIL, 0=NONE
+        if isinstance(r, int):
+            if r != 1:
+                return False, "removed_mux_bad_scan"
+        elif isinstance(r, str):
+            if r.upper() != "OK":
+                return False, "removed_mux_bad_scan"
+        else:
+            return False, "removed_mux_bad_scan"
+
+        return True, "ok"
 
     def build_mux_conf_from_defaults(self, mux_class: dict) -> dict:
         """
@@ -1306,107 +1433,109 @@ class TVHeadendScanner:
             "stream_probes": stream_probes,
         }
 
-    def prune_invalid_services_per_channel(
-            self,
-            net_uuid: str,
-            *,
-            drop_services_without_name: bool = True,
-            delete_empty_channels: bool = True,
-            settle_delay: float = 0.4,
-    ) -> dict:
-        """
-        Final safety net:
-          - remove channel services whose mux is not enabled or scan_result != OK
-          - remove services not in this network
-          - optionally drop unnamed/ghost services (svcname null)
-          - delete channels that end up with no services
-        """
-        good_muxes = self.get_good_muxes(net_uuid)
-        svc_index = self.build_service_index()  # service_uuid -> entry
-        svc_to_mux = self.get_service_to_mux_map()  # service_uuid -> mux_uuid
-
+    def prune_invalid_services_per_channel(self, net_uuid: str) -> dict:
         channels = self.get_channel_grid()
-        updated = 0
-        deleted = 0
-        removed_links = 0
-        skipped = 0
+        mux_index = self.get_mux_index(net_uuid=net_uuid)
+
+        self.log.out(f"prune: mux_index_size={len(mux_index)}")
+
+        stats = {
+            "channels_total": len(channels),
+            "channels_updated": 0,
+            "channels_deleted": 0,
+            "service_links_removed": 0,
+            "channels_unchanged": 0,
+            "reasons": {
+                "no_services": 0,
+                "all_services_ok": 0,
+                "channel_missing_uuid": 0,
+
+                # new, more specific:
+                "removed_unknown_mux": 0,
+                "removed_wrong_network": 0,
+                "removed_mux_disabled": 0,
+                "removed_mux_bad_scan": 0,
+                "removed_service_missing_mux": 0,
+                "removed_service_uuid_invalid": 0,
+            },
+            "debug": {
+                "mux_index_size": len(mux_index),
+                "services_seen": 0,
+                "services_kept": 0,
+                "services_removed": 0,
+            }
+        }
 
         for ch in channels:
-            cu = ch.get("uuid")
-            if not isinstance(cu, str) or not cu:
+            chan_uuid = ch.get("uuid")
+            if not isinstance(chan_uuid, str) or not chan_uuid:
+                stats["reasons"]["channel_missing_uuid"] += 1
                 continue
 
             services = ch.get("services") or []
             if not isinstance(services, list):
                 services = []
 
-            # Keep only those mapped to a good mux
-            kept: List[str] = []
-            seen: Set[str] = set()
+            if not services:
+                stats["reasons"]["no_services"] += 1
+                continue
+
+            kept: list[str] = []
+            removed: list[str] = []
+            removed_reasons: list[str] = []
 
             for su in services:
+                stats["debug"]["services_seen"] += 1
+
                 if not isinstance(su, str) or not su:
-                    continue
-                if su in seen:
-                    continue
-                seen.add(su)
-
-                mux_uuid = svc_to_mux.get(su)
-                if not mux_uuid or mux_uuid not in good_muxes:
-                    removed_links += 1
+                    removed.append(str(su))
+                    removed_reasons.append("removed_service_uuid_invalid")
                     continue
 
-                if drop_services_without_name:
-                    s = svc_index.get(su)
-                    svcname = s.get("svcname") if isinstance(s, dict) else None
-                    if not (isinstance(svcname, str) and svcname.strip()):
-                        # This is exactly your earlier “sid-only” ghost pattern.
-                        removed_links += 1
-                        continue
-
-                kept.append(su)
-
-            if kept == services:
-                skipped += 1
-                continue
-
-            if not kept and delete_empty_channels:
-                if self.config.dry_run:
-                    self.log.out(
-                        f"[dry-run] Would delete channel with no valid services: uuid={cu} name={ch.get('name')!r}")
-                    deleted += 1
+                ok, reason = self.service_is_acceptable(
+                    su, net_uuid=net_uuid, mux_index=mux_index
+                )
+                if ok:
+                    kept.append(su)
+                    stats["debug"]["services_kept"] += 1
                 else:
-                    if self.delete_channel_uuid(cu):
-                        deleted += 1
-                        time.sleep(settle_delay)
+                    removed.append(su)
+                    removed_reasons.append(reason)
+                    stats["debug"]["services_removed"] += 1
+
+            if not removed:
+                stats["channels_unchanged"] += 1
+                stats["reasons"]["all_services_ok"] += 1
                 continue
 
-            # Update channel->services
-            ent = self._idnode_load_entry(cu)
-            cls = ent.get("class") if ent else None
+            # Attribute reason counts
+            for r in removed_reasons:
+                if r in stats["reasons"]:
+                    stats["reasons"][r] += 1
+
+            stats["service_links_removed"] += len(removed)
 
             if self.config.dry_run:
                 self.log.out(
-                    f"[dry-run] Would prune channel uuid={cu} name={ch.get('name')!r} services={services} -> {kept}")
-                updated += 1
+                    f"[dry-run] Would prune channel {ch.get('name')} uuid={chan_uuid} "
+                    f"removed={removed} kept={kept} reasons={removed_reasons}"
+                )
+                stats["channels_updated"] += 1
                 continue
 
-            ok = self.idnode_save_params(uuid=cu, cls=cls, changes={"services": kept})
-            if ok:
-                updated += 1
-                time.sleep(settle_delay)
-            else:
-                self.log.err(f"Failed to prune services for channel uuid={cu} name={ch.get('name')!r}")
+            ent = self._idnode_load_entry(chan_uuid)
+            cls = ent.get("class") if ent else None
 
-        stats = {
-            "channels_total": len(channels),
-            "channels_updated": updated,
-            "channels_deleted": deleted,
-            "service_links_removed": removed_links,
-            "channels_skipped": skipped,
-            "good_muxes": len(good_muxes),
-        }
-        self.log.out(f"prune_invalid_services_per_channel: {stats}")
+            if kept:
+                ok = self.idnode_save_params(uuid=chan_uuid, cls=cls, changes={"services": kept})
+                if ok:
+                    stats["channels_updated"] += 1
+            else:
+                if self.delete_channel_uuid(chan_uuid):
+                    stats["channels_deleted"] += 1
+
+            time.sleep(0.05)
+
         return stats
 
     def scan(self, progress_callback: Optional[Callable[[str, MuxStates], None]] = None) -> bool:
@@ -1499,6 +1628,9 @@ class TVHeadendScanner:
             log(f"Waiting for scan to settle. {elapsed:.1f}s elapsed. {states}.")
             time.sleep(self.config.sleep_secs)
 
+        log("Sleeping to let tvheadend settle...")
+        time.sleep(2.0)
+
         # Step 6: Start service mapping
         # In order:
         # - Delete orphan channels (no services attached)
@@ -1512,6 +1644,9 @@ class TVHeadendScanner:
         log("Deleting orphan channels...")
         deleted = self.delete_orphan_channels()
         log(f"Deleted {deleted} orphan channels.")
+
+        log("Disabling failed muxes")
+        self.disable_failed_muxes(net_uuid)
 
         # At this point, services are authoritative, channel names come from svcname,
         # and channels have valid services. So we can now map services to channels.
@@ -1532,17 +1667,14 @@ class TVHeadendScanner:
         dedup_stats = self.deduplicate_channels_by_name(net_uuid)
         log(f"Dedup stats: {dedup_stats}")
 
-        time.sleep(1)  # Let tuners and table decoding settle.
+        log("Sleeping to let tuners and table decoding settle...")
+        time.sleep(1)
 
         log("Pruning invalid services per channel (final safety net)...")
-        prune_stats = self.prune_invalid_services_per_channel(
-            net_uuid,
-            drop_services_without_name=True,
-            delete_empty_channels=True,
-            settle_delay=0.4,
-        )
+        prune_stats = self.prune_invalid_services_per_channel(net_uuid)
         log(f"Prune stats: {prune_stats}")
 
+        log("Sleeping to reduce flakiness due to immediate retuning after write...")
         time.sleep(1)  # Reduce "immediate retune after write" flakiness.
 
         log("Done with scan.")
