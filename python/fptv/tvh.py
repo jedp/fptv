@@ -25,6 +25,14 @@ Scan Pipeline:
  - Delete unnamed channels
  - Deduplicate channels by name
  - Prune invalid services per channel ← final safety net
+
+TODO
+ - tightening sleeps vs throughput
+ - optional service-grid hygiene
+ - maybe locking channel numbers if you want absolute determinism across rescans
+ - tighten up callback logic for benefit of UX
+ - Add channel numbers to data class
+ - Add program in progress to listing? (Requires EPG data, which we're fighting with.)
 """
 
 from __future__ import annotations
@@ -383,6 +391,56 @@ class TVHeadendScanner:
         if isinstance(r, str):
             return r.upper() == "OK"
         return False
+
+    def debug_channel_service_mux_health(self, net_uuid: str) -> dict:
+        mux_index = self.get_mux_index(net_uuid=net_uuid)
+
+        # service_uuid -> mux_uuid (from idnode/load)
+        svc_to_mux: dict[str, str] = {}
+
+        def svc_mux_uuid(su: str) -> str | None:
+            ent = self._idnode_load_entry(su)
+            if not ent:
+                return None
+            params = self._idnode_params_to_map(ent)
+            v = params.get("multiplex_uuid") or params.get("mux_uuid")
+            return v if isinstance(v, str) and v else None
+
+        counts = {
+            "channels": 0,
+            "services": 0,
+            "mux_missing": 0,
+            "mux_unknown": 0,
+            "by_scan_result": {},   # e.g. {1: 51, 2: 0}
+            "by_enabled": {},       # e.g. {True: 51, False: 0}
+        }
+
+        for ch in self.get_channel_grid():
+            counts["channels"] += 1
+            services = ch.get("services") or []
+            if not isinstance(services, list):
+                continue
+            for su in services:
+                if not isinstance(su, str) or not su:
+                    continue
+                counts["services"] += 1
+                mux_uuid = svc_mux_uuid(su)
+                if not mux_uuid:
+                    counts["mux_missing"] += 1
+                    continue
+                svc_to_mux[su] = mux_uuid
+                mux = mux_index.get(mux_uuid)
+                if not mux:
+                    counts["mux_unknown"] += 1
+                    continue
+
+                sr = mux.get("scan_result")
+                en = bool(mux.get("enabled", True))
+                counts["by_scan_result"][sr] = counts["by_scan_result"].get(sr, 0) + 1
+                counts["by_enabled"][en] = counts["by_enabled"].get(en, 0) + 1
+
+        self.log.out(f"debug_channel_service_mux_health: {counts}")
+        return counts
 
     def get_mux_health_for_network(self, net_uuid: str) -> dict[str, dict]:
         """
@@ -1534,8 +1592,6 @@ class TVHeadendScanner:
                 if self.delete_channel_uuid(chan_uuid):
                     stats["channels_deleted"] += 1
 
-            time.sleep(0.05)
-
         return stats
 
     def scan(self, progress_callback: Optional[Callable[[str, MuxStates], None]] = None) -> bool:
@@ -1647,6 +1703,8 @@ class TVHeadendScanner:
 
         log("Disabling failed muxes")
         self.disable_failed_muxes(net_uuid)
+        log("Sleeping to let service graph settle...")
+        time.sleep(0.5)
 
         # At this point, services are authoritative, channel names come from svcname,
         # and channels have valid services. So we can now map services to channels.
@@ -1670,10 +1728,12 @@ class TVHeadendScanner:
         log("Sleeping to let tuners and table decoding settle...")
         time.sleep(1)
 
+        log("Debug: Health check ...")
+        self.debug_channel_service_mux_health(net_uuid)
+
         log("Pruning invalid services per channel (final safety net)...")
         prune_stats = self.prune_invalid_services_per_channel(net_uuid)
         log(f"Prune stats: {prune_stats}")
-
         log("Sleeping to reduce flakiness due to immediate retuning after write...")
         time.sleep(1)  # Reduce "immediate retune after write" flakiness.
 
