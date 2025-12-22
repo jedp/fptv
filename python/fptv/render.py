@@ -15,13 +15,15 @@ FG_ACT = (0, 0, 0)
 BG_INACT = (0, 0, 0)
 BG_ACT = (90, 105, 255)
 FG_ALERT = (255, 40, 40)
+FG_ACCENT_BLUE = (90, 105, 255)
+FG_ACCENT_YELLOW = (220, 150, 0)
 
 
 def draw_menu(surface, title_font, item_font,
               items: List[str], selected: int):
     surface.fill((0, 0, 0))
-    text_fp = title_font.render("FP", True, BG_SEL)
-    text_tv = title_font.render("TV", True, FG_NORM)
+    text_fp = title_font.render("FP", True, FG_ACCENT_YELLOW)
+    text_tv = title_font.render("TV", True, FG_ACCENT_BLUE)
     x, y = 60, 60
     surface.blit(text_fp, (x, y))
     surface.blit(text_tv, (x + text_fp.get_width(), y))
