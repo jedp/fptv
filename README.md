@@ -312,3 +312,28 @@ Run at boot:
 
 Now you can manually `sudo systemctl start fptv.service`
 
+
+## Pushbutton On / Off
+
+Pololu 1812 big switch
+
+```
+   Pi                                Pololu
+
+     5V     pin 2 or 4              VOUT     VIN -->
+ GPIO26     pin 37 --\/\/\/\ 10k -- OFF
+ GPIO 3     pin 5 --------+-------- A (ON)
+                          |      x- B (NP)   GND -->
+                          |
+                          |
+                          |
+               GND <--+- -+
+```
+
+/boot/firmware/config.txt
+
+```commandline
+dtoverlay=gpio-shutdown,gpio-pin=3,active-low=1,gpio-pull=up
+
+dtoverlay=gpio-poweroff,gpio-pin=26,active-low=0
+```
