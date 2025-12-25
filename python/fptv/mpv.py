@@ -5,7 +5,7 @@ import os
 import socket
 import subprocess
 import time
-from log import Logger
+from fptv.log import Logger
 from typing import Optional
 
 MPV_SOCK = "/tmp/fptv-mpv.sock"

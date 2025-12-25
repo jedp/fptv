@@ -4,7 +4,7 @@ from typing import List
 
 import pygame
 
-from tvh import Channel
+from fptv.tvh import Channel
 
 FG_NORM = (220, 220, 220)
 FG_SEL = (0, 0, 0)

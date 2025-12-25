@@ -11,12 +11,12 @@ from typing import List
 
 import pygame
 
-from event import Event
-from hw import setup_encoder
-from mpv import MPV
-from tvh import Channel, ScanConfig, TVHeadendScanner
-from render import draw_menu, draw_browse, draw_playing
-from x11 import blanking_disable, blanking_enable, ui_show, ui_hide, mpv_raise, mpv_lower
+from fptv.event import Event
+from fptv.hw import setup_encoder
+from fptv.mpv import MPV
+from fptv.tvh import Channel, ScanConfig, TVHeadendScanner
+from fptv.render import draw_menu, draw_browse, draw_playing
+from fptv.x11 import blanking_disable, blanking_enable, ui_show, ui_hide, mpv_raise, mpv_lower
 
 FPTV_CAPTION = 'fptv'
 

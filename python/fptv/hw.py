@@ -5,7 +5,7 @@ from typing import Tuple
 
 from gpiozero import RotaryEncoder, Button
 
-from event import Event
+from fptv.event import Event
 
 GPIO_ENCODER_A = 17  # GPIO 11
 GPIO_ENCODER_B = 27  # GPIO 13

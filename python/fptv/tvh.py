@@ -47,7 +47,7 @@ from typing import Callable, Iterable, Optional, List, Set
 import requests
 from requests.auth import HTTPDigestAuth
 
-from log import Logger
+from fptv.log import Logger
 
 
 def json_dumps(obj: object) -> str:
