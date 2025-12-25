@@ -44,7 +44,7 @@ class State:
             self.channels = []
 
 
-class FPTV:
+class App:
     def __init__(self):
         self.running = False
         self.mpv = MPV()

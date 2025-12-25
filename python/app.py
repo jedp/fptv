@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 if __name__ == "__main__":
-    import kiosk
+    import fptv.kiosk
 
-    app = kiosk.FPTV()
+    app = fptv.kiosk.App()
     exit_code = 0
     try:
         app.mainloop()
