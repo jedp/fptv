@@ -92,13 +92,21 @@ def draw_browse(surface, item_font,
 
 def draw_playing(surface, title_font, item_font, small_font, name: str):
     surface.fill((0, 0, 0))
-    img = small_font.render("Press to stop and return", True, (160, 160, 160))
+    img = small_font.render("Press to stop and return", True, FG_NORM)
     surface.blit(img, (20, 20))
     draw_centered_text(surface, title_font, "Playing", 90)
     draw_centered_text(surface, item_font, name, 190)
 
 
-def draw_centered_text(surface, font, text, y, bold=False, color=FG_NORM):
+def draw_escaping(surface, large_font, small_font):
+    surface.fill((0, 0, 0))
+    text_title = large_font.render("Escape the Package!", True, FG_ALERT)
+    surface.blit(text_title, (20, 20))
+    msg = small_font.render("If you're confused, press the power button.", True, FG_NORM)
+    surface.blit(msg, (20, 100))
+
+
+def draw_centered_text(surface, font, text, y, color=FG_NORM):
     img = font.render(text, True, color)
     r = img.get_rect(center=(surface.get_width() // 2, y))
     surface.blit(img, r)

@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=fptv
+Description=FPTV Splash Screen
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/fptv
+ScriptFile=/usr/share/plymouth/themes/fptv/fptv.script

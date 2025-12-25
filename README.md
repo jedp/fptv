@@ -317,23 +317,173 @@ Now you can manually `sudo systemctl start fptv.service`
 
 Pololu 1812 big switch
 
+100k bleed on Pololu button A (switch)
+Pololu button B unused
+Diode from GPIO23 (pin16) to prevent back-power to Pi
+10k pullup to 3v3 on GPIO23 (pin16)
+10k resistor between GPIO26 (pin37) and Pololu OFF
+
 ```
    Pi                                Pololu
 
-     5V     pin 2 or 4              VOUT     VIN -->
+     5V     pin 2 or 4              VOUT     VIN --> +5V
  GPIO26     pin 37 --\/\/\/\ 10k -- OFF
- GPIO 3     pin 5 --------+-------- A (ON)
-                          |      x- B (NP)   GND -->
-                          |
-                          |
-                          |
-               GND <--+- -+
+ GPIO23     pin 16 --+->|-+---+---- A (ON)
+                     |    |   |  x- B (NP)   GND --> GND
+                     |    |   |
+  3v3 <- 10k \/\/\/\-+    |   |
+                          |   |
+               GND <--+- -+   +----\/\/\/\ 100k ---> GND
 ```
 
 /boot/firmware/config.txt
 
 ```commandline
-dtoverlay=gpio-shutdown,gpio-pin=3,active-low=1,gpio-pull=up
-
-dtoverlay=gpio-poweroff,gpio-pin=26,active-low=0
+# /boot/firmware/config.txt
+# Note spellings - they are actually correct: gpio_pin vs gpiopin
+dtoverlay=gpio-poweroff,gpiopin=26,active_low=0
 ```
+
+systemd shutdown by button:
+```commandline
+# sudo cat /etc/systemd/system/powerbutton-shutdown.service
+[Unit]
+Description=Shutdown on power button (GPIO23=PIN16)
+DefaultDependencies=no
+After=multi-user.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/bin/gpiomon --num-events=1 --quiet --edges=falling -c gpiochip0 23 && /usr/bin/systemctl poweroff'
+RemainAfterExit=no
+
+# For holding the button 1.5s, do:
+#
+# ExecStart=/bin/sh -c '
+# /usr/bin/gpiomon --edges=falling -c gpiochip0 23 |
+# while read _; do
+#   sleep 1.5
+#   /usr/bin/gpioget gpiochip0 23 | grep -q 0 && /usr/bin/systemctl poweroff
+# done
+# '
+
+[Install]
+WantedBy=multi-user.target
+```
+
+
+`sudo usermod -aG video,input,audio jed`
+
+/etc/systemd/system/fptv.service
+
+```commandline
+[Unit]
+Description=FPTV: Fisher Price TV (Pygame Menu)
+Requires=tvheadend.service
+After=tvheadend.service network.target systemd-user-sessions.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=jed
+SyslogIdentifier=fptv
+WorkingDirectory=/opt/fptv/python
+
+# TVH creds etc (keep these in the env file)
+EnvironmentFile=/etc/fptv-tvheadend-api.env
+
+# Console/KMS: no X11, no DISPLAY
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_AUDIODRIVER=alsa
+Environment=PYTHONUNBUFFERED=1
+
+# Keep /opt read-only: redirect caches
+CacheDirectory=fptv
+StateDirectory=fptv
+Environment=PYTHONPYCACHEPREFIX=/var/cache/fptv/pycache
+Environment=XDG_CACHE_HOME=/var/cache/fptv
+Environment=XDG_STATE_HOME=/var/lib/fptv
+Environment=XDG_CONFIG_HOME=/var/lib/fptv
+
+# Keep display awake (console)
+ExecStartPre=/usr/bin/setterm --blank 0 --powerdown 0
+
+ExecStart=/usr/bin/python3 /opt/fptv/python/app.py
+
+# Run on the real console
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+
+```
+
+sudo raspi-config
+
+    System Options → Boot / Auto Login
+
+    Choose Console Autologin
+
+sudo usermod -aG video,render,input,audio jed
+
+sudo setterm --blank 0 --powerdown 0
+
+sudo systemctl disable lightdm.service
+sudo systemctl stop lightdm.service
+sudo systemctl mask lightdm.service
+
+
+systemctl get-default
+should return `multi-user.target`
+
+
+### Splash Screen
+
+sudo cp -r /usr/share/plymouth/themes/pix /usr/share/plymouth/themes/fptv
+
+adjust as desired
+change pix to pftv
+
+```
+sudo plymouth-set-default-theme fptv
+sudo update-initramfs -u
+```
+
+Result:
+
+```commandline
+update-initramfs: Generating /boot/initrd.img-6.12.47+rpt-rpi-v8
+'/boot/initrd.img-6.12.47+rpt-rpi-v8' -> '/boot/firmware/initramfs8'
+update-initramfs: Generating /boot/initrd.img-6.12.47+rpt-rpi-2712
+'/boot/initrd.img-6.12.47+rpt-rpi-2712' -> '/boot/firmware/initramfs_2712'
+```
+
+#### Alternative: No splash:
+
+If you want power → black → pygame, this is the cleanest.
+
+```
+sudo systemctl disable plymouth.service
+sudo systemctl disable plymouth-start.service
+sudo systemctl disable plymouth-quit.service
+```
+
+
+Then remove splash from /boot/firmware/cmdline.txt (keep quiet).
+
+Reboot → screen stays black until pygame starts.
+
+This is common for kiosks and embedded systems.
