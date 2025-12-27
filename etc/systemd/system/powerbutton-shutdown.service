@@ -1,0 +1,23 @@
+[Unit]
+Description=Shutdown on power button (GPIO23=PIN16)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c '/usr/bin/gpiomon --num-events=1 --quiet --edges=falling --bias=pull-up -c gpiochip0 23 && /usr/bin/systemctl poweroff'
+Restart=always
+RestartSec=3
+
+# For holding the button 1.5s, do:
+#
+# ExecStart=/bin/sh -c '
+# /usr/bin/gpiomon --edges=falling -c gpiochip0 23 |
+# while read _; do
+#   sleep 1.5
+#   /usr/bin/gpioget gpiochip0 23 | grep -q 0 && /usr/bin/systemctl poweroff
+# done
+# '
+
+[Install]
+WantedBy=multi-user.target
+

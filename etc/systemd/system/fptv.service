@@ -1,0 +1,54 @@
+[Unit]
+Description=FPTV: Fisher Price TV (Pygame Menu)
+Requires=tvheadend.service
+After=tvheadend.service network.target systemd-user-sessions.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=jed
+SyslogIdentifier=fptv
+WorkingDirectory=/opt/fptv/python
+
+# TVH creds etc (keep these in the env file)
+EnvironmentFile=/etc/fptv-tvheadend-api.env
+
+# Console/KMS: no X11, no DISPLAY
+UnsetEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_AUDIODRIVER=alsa
+Environment=PYTHONUNBUFFERED=1
+
+# Keep /opt read-only: redirect caches
+CacheDirectory=fptv
+StateDirectory=fptv
+Environment=PYTHONPYCACHEPREFIX=/var/cache/fptv/pycache
+Environment=XDG_CACHE_HOME=/var/cache/fptv
+Environment=XDG_STATE_HOME=/var/lib/fptv
+Environment=XDG_CONFIG_HOME=/var/lib/fptv
+
+# Keep display awake (console)
+ExecStartPre=/usr/bin/setterm --blank 0 --powerdown 0
+
+ExecStart=/usr/bin/python3 /opt/fptv/python/app.py
+
+# Run on the real console
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+# Special exit code to drop into console.
+Restart=always
+RestartSec=2
+RestartPreventExitStatus=42
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+
