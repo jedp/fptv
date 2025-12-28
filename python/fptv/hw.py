@@ -4,7 +4,7 @@ import time
 from queue import SimpleQueue
 from typing import Tuple
 
-from gpiozero import RotaryEncoder, Button
+from gpiozero import RotaryEncoder, Button, Device
 
 from fptv.event import Event
 
@@ -16,7 +16,7 @@ LONG_PRESS_S = 5.0
 _press_t0 = 0
 
 
-def setup_encoder(q: SimpleQueue) -> Tuple[RotaryEncoder, Button]:
+def _setup_encoder(q: SimpleQueue) -> Tuple[RotaryEncoder, Button]:
     enc = RotaryEncoder(GPIO_ENCODER_A, GPIO_ENCODER_B, bounce_time=0.002)
     btn = Button(GPIO_ENCODER_BUTTON, pull_up=True, bounce_time=0.05)
 
@@ -51,3 +51,16 @@ def setup_encoder(q: SimpleQueue) -> Tuple[RotaryEncoder, Button]:
     btn.when_released = on_released
     print("Encoder GPIOs configured")
     return enc, btn
+
+class FPTVHW:
+    def __init__(self, q: SimpleQueue):
+        self.q = q
+
+        # Channel selection (end); Mode selection (btn).
+        self.enc, self.btn = _setup_encoder(self.q)
+
+    def close(self):
+        self.enc.close()
+        self.btn.close()
+        Device.pin_factory.close()
+        print("GPIOs cleaned up")

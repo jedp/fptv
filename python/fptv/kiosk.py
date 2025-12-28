@@ -10,7 +10,7 @@ from typing import List, Optional
 import pygame
 
 from fptv.event import Event
-from fptv.hw import setup_encoder
+from fptv.hw import FPTVHW
 from fptv.log import Logger
 from fptv.mpv import MPV
 from fptv.render import draw_menu, draw_browse, draw_escaping
@@ -62,8 +62,7 @@ class App:
         self.clock: Optional[pygame.time.Clock] = None
 
         # Setup hardware GPIOs and rotary encoder.
-        # Store references to GPIO objects so they don't get garbage collected.
-        self.encoder, self.button = setup_encoder(self.eventQueue)
+        self.hw = FPTVHW(self.eventQueue)
 
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
 
@@ -279,6 +278,8 @@ class App:
 
     def shutdown(self) -> int:
         try:
+            print("Releasing GPIOs.")
+            self.hw.close()
             print("Shutting down player.")
             self.mpv.shutdown()
             print("Quitting pygame engine.")
