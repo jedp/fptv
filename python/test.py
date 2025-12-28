@@ -2,6 +2,11 @@
 """
 Run the hacky fptv/test.py to test pygame + mpv sharing GL context.
 
+To run from within an ssh session:
+
+sudo openvt -c 1 -s -f -w -- sh -lc \
+        'env -u DISPLAY python3 -u /opt/fptv/python/test.py 2>&1 | tee /tmp/test.log'
+
 You might have to normalize the display first:
 
     sudo systemctl stop fptv.service
@@ -11,11 +16,11 @@ You might have to normalize the display first:
 """
 
 if __name__ == "__main__":
-    import fptv.test
+    from fptv.test2 import main
     import traceback
 
     try:
-        raise SystemExit(fptv.test.main())
+        raise SystemExit(main())
     except Exception:
         traceback.print_exc()
         raise

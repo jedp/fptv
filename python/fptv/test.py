@@ -30,6 +30,8 @@ import pygame
 from fptv.event import Event
 from fptv.hw import FPTVHW
 
+MPV_FORMAT_FLAG = 3
+
 # ----------------------------
 # Minimal libmpv render bindings
 # ----------------------------
@@ -166,6 +168,9 @@ class EmbeddedMPV:
         self._mpv.mpv_set_option_string.argtypes = [c_void_p, c_char_p, c_char_p]
         self._mpv.mpv_set_option_string.restype = c_int
 
+        self._mpv.mpv_set_property.argtypes = [c_void_p, c_char_p, c_int, c_void_p]
+        self._mpv.mpv_set_property.restype = c_int
+
         # int mpv_command(mpv_handle *ctx, const char **args);
         self._mpv.mpv_command.argtypes = [c_void_p, POINTER(c_char_p)]
         self._mpv.mpv_command.restype = c_int
@@ -217,17 +222,22 @@ class EmbeddedMPV:
 
         # Make mpv quiet & kiosk-friendly.
         self._set_opt("terminal", "no")
-        #self._set_opt("msg-level", "all=no")
+        self._set_opt("load-scripts", "no") # Otherwise it loads a bunch of lua scripts
+        self._set_opt("config", "no") # Ignore ~/.config/mpv/mpv.conf
         self._set_opt("input-default-bindings", "no")
         self._set_opt("osc", "no")
 
-        # For debugging. Eventually set to 0.
-        self._set_opt("osd-level", "1")
+        # Remove OSD clutter.
+        self._set_opt("osd-level", "0")
 
-        # Also for debugging. Verbose logging to a file.
-        self._set_opt("log-file", "/tmp/mpv.log")     # mpv supports --log-file :contentReference[oaicite:4]{index=4}
-        self._set_opt("msg-level", "all=v")           # or all=trace while debugging :contentReference[oaicite:5]{index=5}
+        # Configure log level and logfile.
+        self._set_opt("log-file", "/tmp/mpv.log")
+        self._set_opt("msg-level", "all=warn")
+        #self._set_opt("msg-level", "all=no")
 
+        # Optional. Might help present frames more predictably.
+        self._set_opt("video-sync", "display-resample")
+        self._set_opt("interpolation", "no") # Can toggle if necessary. Keeping it simple ('no') for now.
 
         # Helpful defaults for your kiosk use-case.
         self._set_opt("keep-open", "yes")
@@ -235,9 +245,9 @@ class EmbeddedMPV:
 
         # Pi/KMS friendliness
         self._set_opt("gpu-api", "opengl")
-        self._set_opt("opengl-es", "yes")          # :contentReference[oaicite:10]{index=10}
+        self._set_opt("opengl-es", "yes")
         self._set_opt("hwdec", "no")
-        self._set_opt("vd-lavc-dr", "no")          # recommended workaround in render.h notes :contentReference[oaicite:11]{index=11}
+        self._set_opt("vd-lavc-dr", "no")
 
         # YouTube: depends on build/config; harmless if unused.
         self._set_opt("ytdl", "yes")
@@ -274,6 +284,17 @@ class EmbeddedMPV:
         # Register update callback ASAP. mpv will invoke it immediately once set.
         self._mpv.mpv_render_context_set_update_callback(self.render_ctx, self._cb_update, None)
 
+    def set_property_flag(self, name: str, value: bool) -> int:
+        v = ctypes.c_int(1 if value else 0)
+        rc = self._mpv.mpv_set_property(
+            self.handle,
+            name.encode("utf-8"),
+            MPV_FORMAT_FLAG,
+            ctypes.byref(v),
+        )
+        print(f"MPV set_property_flag: {name}={value} rc={rc}")
+        return rc
+
     def shutdown(self) -> None:
         """Free render context and destroy mpv core."""
         if self.render_ctx:
@@ -304,7 +325,7 @@ class EmbeddedMPV:
         """Adjust volume and show an overlay."""
         self.command("add", "volume", str(delta))
         # ${volume} expands inside mpv’s OSD text
-        self.show_text("Vol: ${volume}%", 800)
+        self.show_text(f"    Vol: ${volume}%", 800)
 
     def maybe_render(self, w: int, h: int) -> bool:
         """
@@ -495,6 +516,11 @@ def main() -> int:
     running = True
     clock = pygame.time.Clock()
 
+    # Sequence of procedures:
+    # drain input events (rotary/button)
+    # render if needed
+    # flip only if rendered
+    # sleep/tick
     while running:
         try:
             ev = event_queue.get_nowait()
