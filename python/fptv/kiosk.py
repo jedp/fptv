@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
-
 import os
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
-from typing import List, Optional
+from typing import List
 
 import pygame
 
 from fptv.event import Event
 from fptv.hw import FPTVHW
 from fptv.log import Logger
-from fptv.mpv import MPV
-from fptv.render import draw_menu, draw_browse, draw_escaping
-from fptv.tvh import Channel, ScanConfig, TVHeadendScanner
+from fptv.mpv import EmbeddedMPV
+from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
+from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
+from fptv.tvh import Channel
+
+MPV_FORMAT_FLAG = 3
 
 FPTV_CAPTION = "fptv"
 ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
 
-STATUS_EXIT_TO_SHELL = 42
-
 
 class Screen(Enum):
-    MAIN = auto()
+    MENU = auto()
     BROWSE = auto()
     PLAYING = auto()
     SCAN = auto()
@@ -33,248 +33,149 @@ class Screen(Enum):
 
 @dataclass
 class State:
-    screen: Screen = Screen.MAIN
+    screen: Screen = Screen.MENU
     main_index: int = 0  # 0=Browse 1=Scan 2=Shutdown
     browse_index: int = 0
     channels: List[Channel] = None
     playing_name: str = ""
+    volume: int = 30
 
     def __post_init__(self):
         if self.channels is None:
             self.channels = []
 
 
-class App:
-    """
-    Kiosk app designed for X11-free (console/KMS) operation.
-    """
-
+class FPTV:
     def __init__(self):
-        self.running = False
         self.log = Logger("fptv")
-        self.mpv = MPV()
-        self.tvh = TVHeadendScanner(ScanConfig.from_env())
-        self.eventQueue: SimpleQueue[Event] = SimpleQueue()
-        self.blanking_is_disabled = False
-        self.gui_visible = False
+        self.state = State()
+        self.event_queue = SimpleQueue()
+        self.hw = FPTVHW(self.event_queue)
 
-        self.surface: Optional[pygame.Surface] = None
-        self.clock: Optional[pygame.time.Clock] = None
-
-        # Setup hardware GPIOs and rotary encoder.
-        self.hw = FPTVHW(self.eventQueue)
-
-        os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
-
-        # Bring up the menu UI initially.
-        self._use_display_for_menu()
-
-    def _create_display(self) -> None:
-        """
-        (Re)create the pygame display surface and clock.
-        """
-        pygame.display.set_caption(FPTV_CAPTION)
-        info = pygame.display.Info()
-        self.surface = pygame.display.set_mode((info.current_w, info.current_h), pygame.NOFRAME)
-        self.clock = pygame.time.Clock()
-
-    def _use_display_for_menu(self) -> None:
-        """
-        Initialize pygame for menu rendering.
-
-        Use this to re-initialize the display surface after returning from video.
-        """
-        # Ensure mpv is not holding the DRM device.
-        self.mpv.shutdown()
+        self.mpv = EmbeddedMPV()
+        self.mpv.initialize()
 
         pygame.init()
         pygame.font.init()
-        pygame.mouse.set_visible(False)
+        self._init_renderer()  # creates display + GL context
+        self.mpv = EmbeddedMPV()
+        self.mpv.initialize()  # now GL proc lookup works reliably
 
-        # Fonts
+    def _init_renderer(self):
+        info = pygame.display.Info()
+        w, h = info.current_w, info.current_h
+        pygame.display.set_mode((w, h), pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
+        pygame.mouse.set_visible(False)
         self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSeBd.ttf", 92)
         self.font_item = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
         self.font_small = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 32)
+        self.log.out(f"SDL driver: {pygame.display.get_driver()}")
 
-        self._create_display()
-        self.gui_visible = True
+        self.renderer = GLMenuRenderer(w, h)
+        self.overlays = OverlayManager(
+            screen_w=w,
+            screen_h=h,
+            font=self.font_item,
+            make_text=make_text_overlay,
+            make_volume=make_volume_overlay)
+        self.log.out("Renderer initialized")
 
-    def _use_display_for_video(self) -> None:
-        """
-        Release pygame so mpv can take over KMS/DRM fullscreen output.
+    def mainloop(self) -> int:
+        info = pygame.display.Info()
+        w, h = info.current_w, info.current_h
 
-        This will tear down the pygame video system and release the DRM device.
-        So don't call pygame.event.get() etc. after calling this, without calling
-        _use_display_for_menu() first.
-        """
-        self.gui_visible = False
-        pygame.quit()
-        self.surface = None
-        self.clock = None
+        # Prepare menu surface + GL uploader
+        menu_surf = pygame.Surface((w, h), flags=pygame.SRCALPHA, depth=32).convert_alpha()
 
-    def _pump_pygame_events_to_queue(self) -> None:
-        """
-        Only call this while pygame's video system is initialized (i.e., menu/browse screens).
-        """
-        if not pygame.display.get_init():
-            return
+        # mpv embedded
+        self.mpv.loadfile("av://lavfi:mandelbrot")  # easy test source
+        self.mpv.show_text("Video ready", 800)
 
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                self.eventQueue.put(Event.QUIT)
+        self.mpv.set_property_flag("pause", True)
 
-    def mainloop(self) -> None:
-        state = State(channels=self.tvh.get_playlist_channels())
+        clock = pygame.time.Clock()
+        running = True
 
-        self.running = True
-        while self.running:
-            # Only pump pygame events when video is not playing.
-            if state.screen != Screen.PLAYING:
-                self._pump_pygame_events_to_queue()
+        self.overlays.set_channel_name("Channel: None")
 
-            # Consume hardware/UI events from the queue and update state machine.
+        mode: Screen = Screen.MENU
+        while running:
+            pygame.event.pump()
+            force_flip = False
+
             try:
                 while True:
-                    ev = self.eventQueue.get_nowait()
+                    ev = self.event_queue.get_nowait()
 
-                    if ev == Event.LONG_PRESS:
-                        self._use_display_for_menu()
-                        state.screen = Screen.MAINTENANCE
-
-                    elif ev == Event.QUIT:
-                        self.running = False
-                        break
-
-                    # Ignore rotary while playing video; the button is used to exit.
-                    elif state.screen == Screen.PLAYING:
-                        if ev == Event.PRESS:
-                            # Exit video -> return to browsing
-                            self._use_display_for_menu()  # re-init pygame + recreate surface
-                            state.screen = Screen.BROWSE
-                            # Reset browse index if it was on "Back"
-                            state.browse_index = max(0, state.browse_index)
-                        continue
-
-                    # MENU/BROWSE/SCAN/SHUTDOWN handling
-                    elif ev in (Event.ROT_R, Event.ROT_L):
-                        delta = 1 if ev == Event.ROT_R else -1
-
-                        if state.screen == Screen.MAIN:
-                            state.main_index = max(0, min(2, state.main_index + delta))
-                        elif state.screen == Screen.BROWSE and state.channels:
-                            # Allow -1 as "Back" item
-                            state.browse_index = max(-1, min(len(state.channels) - 1, state.browse_index + delta))
-                        elif state.screen == Screen.SHUTDOWN:
-                            # Two options: Cancel (0) and Shutdown (1)
-                            state.browse_index = max(0, min(1, state.browse_index + delta))
-
-                    elif ev == Event.PRESS:
-                        if state.screen == Screen.MAIN:
-                            if state.main_index == 0:
-                                state.screen = Screen.BROWSE
-                            elif state.main_index == 1:
-                                state.screen = Screen.SCAN
-                            elif state.main_index == 2:
-                                state.screen = Screen.SHUTDOWN
-                            else:
-                                raise ValueError(f"Unhandled menu index: {state.main_index}")
-
-                        elif state.screen == Screen.SCAN:
-                            state.screen = Screen.MAIN
-
-                        elif state.screen == Screen.BROWSE:
-                            if not state.channels:
-                                continue
-
-                            # Back item
-                            if state.browse_index == -1:
-                                state.browse_index = 0
-                                state.screen = Screen.MAIN
-                                continue
-
-                            ch = state.channels[state.browse_index]
-                            state.playing_name = ch.name
-                            state.screen = Screen.PLAYING
-
-                            # Release pygame before handing over to mpv
-                            self._use_display_for_video()
-
-                            # mpv takes over fullscreen (DRM/KMS)
-                            self.mpv.play(ch.url)
-
-                        elif state.screen == Screen.SHUTDOWN:
-                            # 0 = Cancel, 1 = Shutdown
-                            if state.browse_index == 1:
-                                self.eventQueue.put(Event.QUIT)
-                            else:
-                                state.browse_index = 0
-                                state.screen = Screen.MAIN
-
-                        elif state.screen == Screen.MAINTENANCE:
-                            self.log.out(f"Entering maintenance mode: Ignoring event {ev}.")
-
+                    if ev == Event.PRESS:
+                        # Toggle
+                        if mode == Screen.MENU:
+                            mode = Screen.PLAYING
+                            self.mpv.set_property_flag("pause", False)
+                            force_flip = True
                         else:
-                            raise ValueError(f"Unknown screen: {state.screen}")
+                            mode = Screen.MENU
+                            self.mpv.set_property_flag("pause", True)
+                            force_flip = True
 
-                    elif ev == Event.RELEASE:
-                        continue
+                    elif ev in (Event.ROT_R, Event.ROT_L):
+                        if not self.state.channels:
+                            self.log.out("No channels available.")
+                            continue
 
-                    else:
-                        raise ValueError(f"Unknown event: {ev}")
+                        i = self.state.browse_index + 1 if ev == Event.ROT_R else self.state.browse_index - 1
+                        i = max(0, min(len(self.state.channels) - 1, i))
+                        self.state.browse_index = i
+                        ch = self.state.channels[self.state.browse_index]
+                        self.state.playing_name = ch.name
+                        channel_name = f"Channel: {ch.name}"
+                        self.overlays.set_channel_name(channel_name)
+                        self.mpv.loadfile(ch.url)
+
+                        # Move volume controls to other encoder when it's wired up.
+                        # delta = 1 if ev == Event.ROT_R else -1
+                        # vol_value = max(0, min(100, vol_value + delta))
+                        # overlay_vol.update_from_surface(make_volume_overlay(font_item, vol_value))
+                        # vol_until = time.time() + 1.2
+                        # mpv.command("set_property", "volume", str(vol_value))
+
 
             except Empty:
                 pass
 
-            # 3) Render (only when GUI is visible and pygame is active)
-            if self.gui_visible and self.surface is not None and pygame.display.get_init():
-                if state.screen == Screen.MAIN:
-                    draw_menu(self.surface, self.font_title, self.font_item,
-                              ["Browse", "Scan", "Shutdown"], state.main_index)
+            # Render
+            init_viewport(w, h)
 
-                elif state.screen == Screen.SCAN:
-                    draw_menu(self.surface, self.font_title, self.font_item,
-                              ["(not implemented)", "Press to go back"], 1)
+            if mode == Screen.PLAYING:
+                # Clear so the backbuffer is deterministic
+                clear_screen()
 
-                elif state.screen == Screen.SHUTDOWN:
-                    options = [
-                        Channel("Cancel", ""),
-                        Channel("Shutdown and Power Off", ""),
-                    ]
-                    draw_browse(self.surface, self.font_item, options, state.browse_index)
+                # Render video
+                did_render = self.mpv.maybe_render(w, h)
+                self.overlays.tick()
+                self.overlays.draw()
 
-                elif state.screen == Screen.BROWSE:
-                    draw_browse(self.surface, self.font_item, state.channels, state.browse_index)
-
-                elif state.screen == Screen.PLAYING:
-                    # In PLAYING, pygame has been quit and we can't draw overlays here.
-                    pass
-
-                elif state.screen == Screen.MAINTENANCE:
-                    self.log.out("Long press detected. Escaping to shell.")
-                    draw_escaping(self.surface, self.font_item, self.font_small)
+                # If you ever pause video and still want overlays to appear immediately, the clean approach is:
+                # when you update an overlay, set a flag force_one_flip=True
+                if did_render or force_flip:
                     pygame.display.flip()
-                    time.sleep(5)
-                    try:
-                        self.mpv.shutdown()
-                    except Exception as e:
-                        self.log.err(f"Error shutting down mpv: {e}")
-                        pass
-                    try:
-                        pygame.quit()
-                    except Exception as e:
-                        self.log.err(f"Error shutting down pygame: {e}")
-                        pass
-                    raise SystemExit(STATUS_EXIT_TO_SHELL)
+                    self.mpv.report_swap()
+                else:
+                    # If mpv produced no new frame, don't flip (avoids buffer ping-pong flicker)
+                    time.sleep(0.002)
 
+            else:
+                # MENU: draw menu into texture and present
+                draw_menu_surface(menu_surf, self.font_item, "Press button to toggle video")
+                self.renderer.update_from_surface(menu_surf)
+
+                clear_screen()
+                self.renderer.draw_fullscreen()
                 pygame.display.flip()
 
-                if self.clock:
-                    self.clock.tick(30)
-            else:
-                # While playing video (or if display isn't up yet), avoid spinning hot.
-                time.sleep(0.02)
+            clock.tick(60)
 
-        self.shutdown()
+        return self.shutdown()
 
     def shutdown(self) -> int:
         try:
@@ -286,7 +187,11 @@ class App:
             pygame.quit()
         except Exception as e:
             print(f"Error during shutdown: {e}")
-            return 1
+            return -1
 
         print("Bye!")
         return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(FPTV().mainloop())
