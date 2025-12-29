@@ -7,7 +7,6 @@ from queue import SimpleQueue, Empty
 from typing import List
 
 import pygame
-from pygame import FULLSCREEN, OPENGL, DOUBLEBUF
 
 from fptv.event import Event
 from fptv.hw import FPTVHW
@@ -15,7 +14,7 @@ from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
-from fptv.tvh import Channel
+from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
 
 MPV_FORMAT_FLAG = 3
 
@@ -49,17 +48,17 @@ class State:
 class FPTV:
     def __init__(self):
         self.log = Logger("fptv")
-        self.state = State()
         self.event_queue = SimpleQueue()
+        self.tvh = TVHeadendScanner(ScanConfig.from_env())
         self.hw = FPTVHW(self.event_queue)
+        self.state = State(channels=self.tvh.get_playlist_channels())
 
         pygame.init()
         pygame.font.init()
 
-        self._init_renderer()          # creates GL context + renderer + overlays
+        self._init_renderer()  # creates GL context + renderer + overlays
         self.mpv = EmbeddedMPV()
-        self.mpv.initialize()          # now GL proc lookup is valid
-
+        self.mpv.initialize()  # now GL proc lookup is valid
 
     def _init_renderer(self):
         pygame.display.set_mode((0, 0), pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
@@ -69,7 +68,7 @@ class FPTV:
         self.log.out(f"SDL driver: {pygame.display.get_driver()} size={w}x{h}")
 
         self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSeBd.ttf", 92)
-        self.font_item  = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
+        self.font_item = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
         self.font_small = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 32)
 
         self.renderer = GLMenuRenderer(w, h)
