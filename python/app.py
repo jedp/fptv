@@ -17,7 +17,7 @@ You might have to normalize the display first:
 if __name__ == "__main__":
     import fptv.kiosk
 
-    app = fptv.kiosk.App()
+    app = fptv.kiosk.FPTV()
     exit_code = 0
     try:
         app.mainloop()

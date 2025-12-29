@@ -308,20 +308,17 @@ class EmbeddedMPV:
         # ${volume} expands inside mpv’s OSD text
         self.show_text(f"    Vol: ${volume}%", 800)
 
-    def maybe_render(self, w: int, h: int) -> bool:
+    def maybe_render(self, w: int, h: int, force: bool = False) -> bool:
         """
         Return true of mpv drew a new frame into the backbuffer. False otherwise.
         """
         if not self._render_ctx:
             return False
 
-        # Normal mode: only redraw when mpv signals it
-        if not self._update_event.is_set():
-            return False
-        self._update_event.clear()
-
         flags = int(self._mpv.mpv_render_context_update(self._render_ctx))
-        if (flags & MPV_RENDER_UPDATE_FRAME) == 0:
+        want = (flags & MPV_RENDER_UPDATE_FRAME) != 0
+
+        if not want and not force:
             return False
 
         if self._gl:
@@ -330,13 +327,13 @@ class EmbeddedMPV:
         fbo = mpv_opengl_fbo(fbo=0, w=w, h=h, internal_format=0)
         flip_y = c_int(1)
 
-        rparams = (mpv_render_param * 3)(
+        render_params = (mpv_render_param * 3)(
             mpv_render_param(MPV_RENDER_PARAM_OPENGL_FBO, ctypes.cast(byref(fbo), c_void_p)),
             mpv_render_param(MPV_RENDER_PARAM_FLIP_Y, ctypes.cast(byref(flip_y), c_void_p)),
             mpv_render_param(MPV_RENDER_PARAM_INVALID, None),
         )
 
-        rc = self._mpv.mpv_render_context_render(self._render_ctx, rparams)
+        rc = self._mpv.mpv_render_context_render(self._render_ctx, render_params)
         return rc >= 0
 
     def poll_events(self) -> None:
