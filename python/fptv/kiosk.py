@@ -7,6 +7,7 @@ from queue import SimpleQueue, Empty
 from typing import List
 
 import pygame
+from pygame import FULLSCREEN, OPENGL, DOUBLEBUF
 
 from fptv.event import Event
 from fptv.hw import FPTVHW
@@ -52,32 +53,32 @@ class FPTV:
         self.event_queue = SimpleQueue()
         self.hw = FPTVHW(self.event_queue)
 
-        self.mpv = EmbeddedMPV()
-        self.mpv.initialize()
-
         pygame.init()
         pygame.font.init()
-        self._init_renderer()  # creates display + GL context
+
+        self._init_renderer()          # creates GL context + renderer + overlays
         self.mpv = EmbeddedMPV()
-        self.mpv.initialize()  # now GL proc lookup works reliably
+        self.mpv.initialize()          # now GL proc lookup is valid
+
 
     def _init_renderer(self):
-        info = pygame.display.Info()
-        w, h = info.current_w, info.current_h
-        pygame.display.set_mode((w, h), pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
+        pygame.display.set_mode((0, 0), pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
         pygame.mouse.set_visible(False)
+
+        w, h = pygame.display.get_surface().get_size()
+        self.log.out(f"SDL driver: {pygame.display.get_driver()} size={w}x{h}")
+
         self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSeBd.ttf", 92)
-        self.font_item = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
+        self.font_item  = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
         self.font_small = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 32)
-        self.log.out(f"SDL driver: {pygame.display.get_driver()}")
 
         self.renderer = GLMenuRenderer(w, h)
         self.overlays = OverlayManager(
-            screen_w=w,
-            screen_h=h,
+            screen_w=w, screen_h=h,
             font=self.font_item,
             make_text=make_text_overlay,
-            make_volume=make_volume_overlay)
+            make_volume=make_volume_overlay,
+        )
         self.log.out("Renderer initialized")
 
     def mainloop(self) -> int:
