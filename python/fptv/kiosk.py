@@ -96,8 +96,10 @@ class FPTV:
         clock = pygame.time.Clock()
         running = True
 
+        channel_overlay_changed = False
         self.overlays.set_channel_name("Channel: None")
 
+        channel_change_debouncing = time.time()
         mode: Screen = Screen.MENU
         while running:
             pygame.event.pump()
@@ -128,9 +130,8 @@ class FPTV:
                         self.state.browse_index = i
                         ch = self.state.channels[self.state.browse_index]
                         self.state.playing_name = ch.name
-                        channel_name = f"Channel: {ch.name}"
-                        self.overlays.set_channel_name(channel_name)
-                        self.mpv.loadfile(ch.url)
+                        channel_overlay_changed = True
+                        channel_change_debouncing = time.time()
 
                         # Move volume controls to other encoder when it's wired up.
                         # delta = 1 if ev == Event.ROT_R else -1
@@ -151,13 +152,22 @@ class FPTV:
                 clear_screen()
 
                 # Render video
-                did_render = self.mpv.maybe_render(w, h)
+                did_render = self.mpv.maybe_render(w, h, force=channel_overlay_changed)
                 self.overlays.tick()
                 self.overlays.draw()
 
+                if channel_change_debouncing > 0:
+                    now = time.time()
+                    if now > channel_change_debouncing + 0.150:
+                        ch = self.state.channels[self.state.browse_index]
+                        channel_overlay_changed |= self.overlays.set_channel_name(ch.name)
+                        self.log.out(f"Change to channel: {ch.name}")
+                        self.mpv.loadfile(ch.url)
+                        channel_change_debouncing = 0
+
                 # If you ever pause video and still want overlays to appear immediately, the clean approach is:
                 # when you update an overlay, set a flag force_one_flip=True
-                if did_render or force_flip:
+                if did_render or channel_overlay_changed or force_flip:
                     pygame.display.flip()
                     self.mpv.report_swap()
                 else:

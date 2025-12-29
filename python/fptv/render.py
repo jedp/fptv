@@ -383,6 +383,7 @@ class OverlayManager:
         self.font = font
         self._make_text = make_text
         self._make_volume = make_volume
+        self._dirty = False
 
         # Slots
         self.channel = OverlaySlot(
@@ -410,17 +411,22 @@ class OverlayManager:
             self._surface_cache[key] = s
         return s
 
-    def set_channel_name(self, name: str, *, seconds: Optional[float] = None) -> None:
+    def set_channel_name(self, name: str, *, seconds: Optional[float] = None) -> bool:
         key = ("channel", name)
+        changed = False
         if key != self.channel.content_key:
             surf = self._get_surface_cached(key, lambda: self._make_text(self.font, name))
             self.channel.quad.update_from_surface(surf)
             self.channel.content_key = key
+            changed = True
 
         if seconds is None:
             self.channel.set_persistent()
         else:
             self.channel.set_visible_for(seconds)
+
+        self._dirty |= changed
+        return changed
 
     def bump_volume(self, vol: int, *, seconds: float = 1.2) -> None:
         """
@@ -434,6 +440,13 @@ class OverlayManager:
             self.volume.content_key = key
 
         self.volume.set_visible_for(seconds)
+
+        self._dirty = True
+
+    def consume_dirty(self) -> bool:
+        dirty = self._dirty
+        self._dirty = False
+        return dirty
 
     # ---- per-frame ----
 
