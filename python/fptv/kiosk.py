@@ -96,14 +96,15 @@ class FPTV:
         clock = pygame.time.Clock()
         running = True
 
-        channel_overlay_changed = False
-        self.overlays.set_channel_name("Channel: None")
-
         channel_change_debouncing = time.time()
         mode: Screen = Screen.MENU
+        channel_overlay_changed = False
+        self.overlays.set_channel_name("Channel: None")
+        tune_deadline_s = 0.0
+        pending_index = None
+        force_flip = False
         while running:
             pygame.event.pump()
-            force_flip = False
 
             try:
                 while True:
@@ -129,9 +130,10 @@ class FPTV:
                         i = max(0, min(len(self.state.channels) - 1, i))
                         self.state.browse_index = i
                         ch = self.state.channels[self.state.browse_index]
-                        self.state.playing_name = ch.name
-                        channel_overlay_changed = True
-                        channel_change_debouncing = time.time()
+                        channel_overlay_changed |= self.overlays.set_channel_name(f"Channel: {ch.name}")
+                        pending_index = self.state.browse_index
+                        # Debounce tuning change.
+                        tune_deadline_s = time.time() + 0.150
 
                         # Move volume controls to other encoder when it's wired up.
                         # delta = 1 if ev == Event.ROT_R else -1
@@ -148,28 +150,24 @@ class FPTV:
             init_viewport(w, h)
 
             if mode == Screen.PLAYING:
-                # Clear so the backbuffer is deterministic
                 clear_screen()
 
-                # Render video
                 did_render = self.mpv.maybe_render(w, h, force=channel_overlay_changed)
                 self.overlays.tick()
                 self.overlays.draw()
 
-                if channel_change_debouncing > 0:
-                    now = time.time()
-                    if now > channel_change_debouncing + 0.150:
-                        ch = self.state.channels[self.state.browse_index]
-                        channel_overlay_changed |= self.overlays.set_channel_name(ch.name)
-                        self.log.out(f"Change to channel: {ch.name}")
-                        self.mpv.loadfile(ch.url)
-                        channel_change_debouncing = 0
+                now = time.time()
+                if pending_index is not None and now >= tune_deadline_s:
+                    ch = self.state.channels[pending_index]
+                    self.log.out(f"Tune to channel: {ch.name}")
+                    self.mpv.loadfile(ch.url)
+                    pending_index = None
 
-                # If you ever pause video and still want overlays to appear immediately, the clean approach is:
-                # when you update an overlay, set a flag force_one_flip=True
                 if did_render or channel_overlay_changed or force_flip:
                     pygame.display.flip()
                     self.mpv.report_swap()
+                    channel_overlay_changed = False
+                    force_flip = False
                 else:
                     # If mpv produced no new frame, don't flip (avoids buffer ping-pong flicker)
                     time.sleep(0.002)

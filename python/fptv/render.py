@@ -335,33 +335,40 @@ class GLMenuRenderer:
 
 @dataclass
 class OverlaySlot:
-    """
-    One on-screen overlay layer backed by a GLOverlayQuad texture.
-    Uploads only when 'content_key' changes.
-    """
     quad: "GLOverlayQuad"
     x: int
     y: int
     visible: bool = True
     expires_at: Optional[float] = None  # None = persistent
-    content_key: Optional[Tuple] = None  # (type, text, maybe other args)
+    content_key: Optional[Tuple] = None
 
-    def set_visible_for(self, seconds: float) -> None:
+    def set_visible_for(self, seconds: float) -> bool:
+        new_expires = time.time() + seconds
+        # abs(... ) > 1e-3 avoids "always changed" due to tiny float differences
+        changed = (not self.visible) or (self.expires_at is None) or (abs(self.expires_at - new_expires) > 1e-3)
         self.visible = True
-        self.expires_at = time.time() + seconds
+        self.expires_at = new_expires
+        return changed
 
-    def set_persistent(self) -> None:
+    def set_persistent(self) -> bool:
+        changed = (not self.visible) or (self.expires_at is not None)
         self.visible = True
         self.expires_at = None
+        return changed
 
-    def hide(self) -> None:
+    def hide(self) -> bool:
+        changed = self.visible or (self.expires_at is not None)
         self.visible = False
         self.expires_at = None
+        return changed
 
-    def tick(self, now: float) -> None:
+    def tick(self, now: float) -> bool:
         if self.expires_at is not None and now >= self.expires_at:
+            # This is a real visual change: overlay disappears.
             self.visible = False
             self.expires_at = None
+            return True
+        return False
 
 
 class OverlayManager:
@@ -414,6 +421,7 @@ class OverlayManager:
     def set_channel_name(self, name: str, *, seconds: Optional[float] = None) -> bool:
         key = ("channel", name)
         changed = False
+
         if key != self.channel.content_key:
             surf = self._get_surface_cached(key, lambda: self._make_text(self.font, name))
             self.channel.quad.update_from_surface(surf)
@@ -421,12 +429,13 @@ class OverlayManager:
             changed = True
 
         if seconds is None:
-            self.channel.set_persistent()
+            vis_changed = self.channel.set_persistent()
         else:
-            self.channel.set_visible_for(seconds)
+            vis_changed = self.channel.set_visible_for(seconds)
 
-        self._dirty |= changed
-        return changed
+        dirty = changed or vis_changed
+        self._dirty |= dirty
+        return dirty
 
     def bump_volume(self, vol: int, *, seconds: float = 1.2) -> None:
         """
@@ -452,8 +461,11 @@ class OverlayManager:
 
     def tick(self) -> None:
         now = time.time()
-        self.channel.tick(now)
-        self.volume.tick(now)
+        changed = False
+        changed |= self.channel.tick(now)
+        changed |= self.volume.tick(now)
+
+        self._dirty |= changed
 
     def draw(self) -> None:
         # Draw in your preferred order (channel first, then volume on top)
