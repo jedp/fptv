@@ -310,55 +310,34 @@ class EmbeddedMPV:
 
     def maybe_render(self, w: int, h: int) -> bool:
         """
-        Call this from your main loop. If mpv wants a redraw, render a frame into
-        the current OpenGL framebuffer.
+        Return true of mpv drew a new frame into the backbuffer. False otherwise.
         """
         if not self._render_ctx:
             return False
 
-        # Debugging; uncomment me later
-        # if not self._update_event.is_set():
-        #    return
-
-        # If advanced control is enabled, mpv requires you to call update() after each callback.
-        # update() returns flags; if MPV_RENDER_UPDATE_FRAME is set, render.
+        # Normal mode: only redraw when mpv signals it
+        if not self._update_event.is_set():
+            return False
         self._update_event.clear()
 
-        # It's possible multiple callbacks happened; loop until update returns 0.
-        did_render = False
-        while True:
-            flags = int(self._mpv.mpv_render_context_update(self._render_ctx))
-            if (flags & MPV_RENDER_UPDATE_FRAME) == 0:
-                break
+        flags = int(self._mpv.mpv_render_context_update(self._render_ctx))
+        if (flags & MPV_RENDER_UPDATE_FRAME) == 0:
+            return False
 
-            if self._gl:
-                self._gl.glViewport(0, 0, w, h)
+        if self._gl:
+            self._gl.glViewport(0, 0, w, h)
 
-            fbo = mpv_opengl_fbo(fbo=0, w=w, h=h, internal_format=0)
-            flip_y = c_int(1)  # useful when rendering to the default framebuffer
+        fbo = mpv_opengl_fbo(fbo=0, w=w, h=h, internal_format=0)
+        flip_y = c_int(1)
 
-            rparams = (mpv_render_param * 3)(
-                mpv_render_param(MPV_RENDER_PARAM_OPENGL_FBO, ctypes.cast(byref(fbo), c_void_p)),
-                mpv_render_param(MPV_RENDER_PARAM_FLIP_Y, ctypes.cast(byref(flip_y), c_void_p)),
-                mpv_render_param(MPV_RENDER_PARAM_INVALID, None),
-            )
+        rparams = (mpv_render_param * 3)(
+            mpv_render_param(MPV_RENDER_PARAM_OPENGL_FBO, ctypes.cast(byref(fbo), c_void_p)),
+            mpv_render_param(MPV_RENDER_PARAM_FLIP_Y, ctypes.cast(byref(flip_y), c_void_p)),
+            mpv_render_param(MPV_RENDER_PARAM_INVALID, None),
+        )
 
-            rc = self._mpv.mpv_render_context_render(self._render_ctx, rparams)
-            if rc < 0:
-                # If you want: print or log rc
-                break
-
-            # Tell mpv we swapped a frame (timing/helpful if used consistently).
-            self._mpv.mpv_render_context_report_swap(self._render_ctx)
-
-            # Drain any queued update signals quickly (if one arrived mid-loop).
-            if not self._update_event.is_set():
-                # If no new callback came in, no need to spin.
-                pass
-
-            did_render = True
-
-        return did_render
+        rc = self._mpv.mpv_render_context_render(self._render_ctx, rparams)
+        return rc >= 0
 
     def poll_events(self) -> None:
         """Optional: drain mpv events (not required for playback, but useful for debugging)."""
