@@ -319,6 +319,15 @@ class EmbeddedMPV:
     def stop(self):
         self._exec("stop")
 
+    def get_volume(self) -> int:
+        """Get current volume level (0-100)."""
+        v = ctypes.c_double()
+        err = self._mpv.mpv_get_property(self._handle, b"volume", MPV_FORMAT_DOUBLE, byref(v))
+        if err < 0:
+            self.log.err(f"mpv_get_property('volume') failed: {err}")
+            return 0
+        return int(v.value)
+
     def report_swap(self) -> None:
         self._mpv.mpv_render_context_report_swap(self._render_ctx)
 
@@ -412,11 +421,11 @@ class EmbeddedMPV:
         # show-text: args are (text, duration-ms[, level])
         self._exec("show-text", text, str(duration_ms))
 
-    def add_volume(self, volume: int) -> None:
-        """Adjust volume and show an overlay."""
-        self._exec("add", "volume", str(volume))
-        # ${volume} expands inside mpv’s OSD text
-        self.show_text(f"    Vol: ${volume}%", 800)
+    def add_volume(self, delta: int) -> None:
+        """
+        Adjust volume and show an overlay.
+        """
+        self._exec("add", "volume", str(delta))
 
     def maybe_render(self, w: int, h: int, force: bool = False) -> bool:
         """

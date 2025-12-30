@@ -10,7 +10,7 @@ from typing import List
 import pygame
 
 from fptv.event import Event
-from fptv.hw import HwEventBinding
+from fptv.hw import HwEventBinding, ENCODER_CHANNEL_NAME, ENCODER_VOLUME_NAME
 from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
@@ -201,6 +201,7 @@ class FPTV:
                 except Empty:
                     break
 
+                ev_src = hwEvent.source
                 ev = hwEvent.event
 
                 if ev == Event.QUIT:
@@ -228,21 +229,25 @@ class FPTV:
                         force_flip = True
 
                 if ev == Event.ROT_L or ev == Event.ROT_R:
-                    if not self.state.channels:
-                        continue
+                    if ev_src == ENCODER_CHANNEL_NAME:
+                        if not self.state.channels:
+                            continue
 
-                    i = self.state.browse_index + (1 if ev == Event.ROT_R else -1)
-                    i = max(0, min(len(self.state.channels) - 1, i))
-                    self.state.browse_index = i
-                    channel = self.state.channels[self.state.browse_index]
-                    self.overlays.set_channel_name(f"Channel: {channel.name}")
-                    force_flip = True
+                        i = self.state.browse_index + (1 if ev == Event.ROT_R else -1)
+                        i = max(0, min(len(self.state.channels) - 1, i))
+                        self.state.browse_index = i
+                        channel = self.state.channels[self.state.browse_index]
+                        self.overlays.set_channel_name(f"Channel: {channel.name}")
+                        force_flip = True
 
-                    # If we're in video mode, schedule a debounced tune to the newly selected channel.
-                    if mode in (Screen.PLAY, Screen.TUNE):
-                        pending_url = channel.url
-                        pending_name = f"Channel: {channel.name}"
-                        debounce_deadline = time.time() + DEBOUNCE_S
+                        # If we're in video mode, schedule a debounced tune to the newly selected channel.
+                        if mode in (Screen.PLAY, Screen.TUNE):
+                            pending_url = channel.url
+                            pending_name = f"Channel: {channel.name}"
+                            debounce_deadline = time.time() + DEBOUNCE_S
+                    elif ev_src == ENCODER_VOLUME_NAME:
+                        delta = 5 if ev == Event.ROT_R else -5
+                        self.mpv.add_volume(delta)
 
             # Render
             init_viewport(self.w, self.h)
