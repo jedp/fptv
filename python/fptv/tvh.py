@@ -141,7 +141,7 @@ class TVHeadendScanner:
         for i in range(attempts):
             try:
                 resp = requests.request(method, url, **kwargs)
-            except requests.RequestException as e:
+            except requests.RequestException:
                 if i == attempts - 1:
                     raise
                 time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
@@ -1827,7 +1827,7 @@ class TVHWatchdog:
 
         # 1) Ask mpv to drop and reload (usually enough)
         try:
-            mpv._command("stop")
+            mpv.stop()
         except Exception as e:
             self.log.err(f"Failed to stop mpv: {e}")
             pass
