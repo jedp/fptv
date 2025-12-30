@@ -108,6 +108,10 @@ class TVHPoller(threading.Thread):
             sleep_for = max(0.05, self.interval_s - dt)
             self._stop_evt.wait(sleep_for)
 
+    def shutdown(self):
+        self.stop()
+        self.join(timeout=2.0)
+
 
 class FPTV:
     def __init__(self, screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
@@ -120,6 +124,7 @@ class FPTV:
         self.poller = TVHPoller(self.tvh, self.tvh_status_q, interval_s=1.0)
         self.hw = HwEventBinding(self.event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
+        self.watch: WatchdogWorker | None = None
 
         pygame.init()
         pygame.font.init()
@@ -178,8 +183,8 @@ class FPTV:
         tuning_started_at = 0.0
         tune_attempts = 0
 
-        watch = WatchdogWorker(self.tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
-        watch.start()
+        self.watch = WatchdogWorker(self.tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
+        self.watch.start()
 
         self.poller.start()
 
@@ -288,14 +293,14 @@ class FPTV:
                         force_flip = True
 
                 # --- publish minimal state to watchdog worker (EVERY FRAME is fine; it's just assignments) ---
-                watch.expecting = (mode in (Screen.TUNE, Screen.PLAY))
-                watch.current_url = active_url
-                watch.tuning_started_at = tuning_started_at
+                self.watch.expecting = (mode in (Screen.TUNE, Screen.PLAY))
+                self.watch.current_url = active_url
+                self.watch.tuning_started_at = tuning_started_at
 
                 # --- drain watchdog actions ---
                 while True:
                     try:
-                        action, url, reason = watch.actions.get_nowait()
+                        action, url, reason = self.watch.actions.get_nowait()
                     except Empty:
                         break
 
@@ -330,8 +335,10 @@ class FPTV:
 
     def shutdown(self) -> int:
         try:
+            print("Stopping watchdog worker.")
+            self.watch.shutdown()
             print("Stopping TVH poller.")
-            self.poller.stop()
+            self.poller.shutdown()
             print("Releasing GPIOs.")
             self.hw.close()
             print("Shutting down player.")
