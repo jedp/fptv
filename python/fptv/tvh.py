@@ -40,15 +40,16 @@ from __future__ import annotations
 import json
 import os
 import random
+import threading
 import time
 from dataclasses import dataclass
+from queue import SimpleQueue
 from typing import Callable, Iterable, Optional, List, Set, Any
 
 import requests
 from requests.auth import HTTPDigestAuth
 
 from fptv.log import Logger
-from fptv.mpv import MPV_USERAGENT
 
 
 def json_dumps(obj: object) -> str:
@@ -127,7 +128,7 @@ class TVHeadendScanner:
         if config.user and config.password:
             self.auth = HTTPDigestAuth(config.user, config.password)
 
-    def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response | None:
         """
         Make an authenticated request to TVHeadend API with sane defaults + simple retry.
         """
@@ -1755,150 +1756,94 @@ class TVHeadendScanner:
 
         return True
 
-class TVHWatchdog:
-    """
-    “Soft” recovery:
-      - We only act on subscriptions that look like *ours* (by client User-Agent substring).
-      - If the subscription is stuck Bad / 0 in/out for too long, we restart the mpv load.
-      - Optionally, if TVH reports a matching connection id, we cancel just that connection.
-    """
-    def __init__(self, tvh: TVHeadendScanner, *, ua_tag: str = MPV_USERAGENT):
+class WatchdogWorker:
+    def __init__(self, tvh, *, ua_tag: str, interval_s: float = 1.0):
         self.tvh = tvh
         self.ua_tag = ua_tag
-        self.log = Logger("watchdog")
-        self._bad_since: Optional[float] = None
-        self._last_fix: float = 0.0
+        self.interval_s = interval_s
+        self.actions = SimpleQueue()   # ("reload", url, reason)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="tvh-watchdog", daemon=True)
 
-        self.log.out(f"Watchdog initialized with UA tag {self.ua_tag}")
+        self._bad_since = None
+        self._last_fix = 0.0
 
-    def find_our_subscription(self, subs: dict[str, Any]) -> Optional[dict[str, Any]]:
+        # optional: reuse a Session inside tvh (see note below)
+        # self.tvh.set_session(...)
+
+    def start(self):
+        self._thread.start()
+
+    def shutdown(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _find_our_sub(self, subs: dict):
         for e in subs.get("entries", []):
-            useragent = (e.get("useragent") or "")
+            ua = (e.get("useragent") or "")
             client = (e.get("client") or "")
             title = (e.get("title") or "")
-            # Depending on TVH version/config, your tag may appear in client; title often just "HTTP".
-            if self.ua_tag in useragent or self.ua_tag in client or self.ua_tag in title:
+            if self.ua_tag in ua or self.ua_tag in client or self.ua_tag in title:
                 return e
         return None
 
-    def check_and_fix(
-            self,
-            *,
-            now: float,
-            mpv,
-            current_url: str,
-            expecting: bool = True,
-            missing_grace_s: float = 3.0,
-    ) -> bool:
-        """
-        Returns True if we took a corrective action.
-
-        This has two modes:
-          1) If a matching subscription exists and looks stuck (Bad / errors / 0 rate), we reload.
-          2) If we *expect* to be streaming but TVH shows **no matching subscription** for too long,
-             we also reload. (This is the case when TVH drops the subscription with
-             "No input detected".)
-        """
-        # Don’t spam TVH if you call this at 60fps.
-        if now - self._last_fix < 1.0:
-            return False
-
-        try:
-            subs = self.tvh.subscriptions()
-        except Exception:
-            return False
-
-        ours = self.find_our_subscription(subs)
-
-        # --- Case A: expected stream but no subscription at all ---
-        if not ours:
-            if not expecting:
-                self._bad_since = None
-                return False
-
-            if self._bad_since is None:
-                self._bad_since = now
-                return False
-
-            if now - self._bad_since < missing_grace_s:
-                return False
-
-            self.log.out(f"No matching subscription for {now - self._bad_since:.1f}s; reloading {current_url}")
-            self._last_fix = now
-            self._bad_since = now  # reset window so we don't thrash
-
+    def _run(self):
+        while not self._stop.is_set():
+            now = time.time()
             try:
-                mpv.stop()
-            except Exception as e:
-                self.log.err(f"Failed to stop mpv: {e}")
+                subs = self.tvh.subscriptions()
+            except Exception:
+                time.sleep(self.interval_s)
+                continue
 
-            try:
-                # Prefer immediate reload if available; fall back to loadfile.
-                if hasattr(mpv, "loadfile_now"):
-                    mpv.loadfile_now(current_url)
+            ours = self._find_our_sub(subs)
+
+            # You’ll set these from the main thread via shared vars / atomic snapshot:
+            expecting = getattr(self, "expecting", False)
+            current_url = getattr(self, "current_url", None)
+            tuning_started_at = getattr(self, "tuning_started_at", 0.0)
+
+            # grace: immediately after tune, missing subscription can be normal
+            if expecting and (now - tuning_started_at) < 1.0:
+                ours = ours  # do nothing special
+
+            took_action = False
+
+            if expecting and current_url:
+                if not ours:
+                    if self._bad_since is None:
+                        self._bad_since = now
+                    elif now - self._bad_since > 3.0 and now - self._last_fix > 1.0:
+                        self._last_fix = now
+                        self._bad_since = now
+                        self.actions.put(("reload", current_url, "missing_subscription"))
+                        took_action = True
                 else:
-                    mpv.loadfile(current_url)
-            except Exception as e:
-                self.log.err(f"Failed to reload url {current_url}: {e}")
+                    state = (ours.get("state") or "")
+                    errs = int(ours.get("errors") or 0)
+                    rate_in = int(ours.get("in") or 0)
+                    rate_out = int(ours.get("out") or 0)
+                    started = int(ours.get("start") or 0)
+                    age = now - started if started else 0.0
 
-            return True
+                    looks_stuck = (
+                            state.lower() == "bad"
+                            or errs > 0
+                            or (age > 3.0 and rate_in == 0 and rate_out == 0)
+                    )
 
-        # --- Case B: we have a subscription, but it looks stuck ---
-        state = (ours.get("state") or "")
-        errs = int(ours.get("errors") or 0)
-        rate_in = int(ours.get("in") or 0)
-        rate_out = int(ours.get("out") or 0)
-        started = int(ours.get("start") or 0)
-        age = now - started if started else 0.0
+                    if not looks_stuck:
+                        self._bad_since = None
+                    else:
+                        if self._bad_since is None:
+                            self._bad_since = now
+                        elif now - self._bad_since > 2.0 and now - self._last_fix > 1.0:
+                            self._last_fix = now
+                            self._bad_since = now
+                            self.actions.put(("reload", current_url, f"stuck:{state}:{errs}:{rate_in}/{rate_out}"))
+                            took_action = True
 
-        looks_stuck = (
-                state.lower() == "bad"
-                or errs > 0
-                or (age > 3.0 and rate_in == 0 and rate_out == 0)
-        )
-
-        if not looks_stuck:
-            self._bad_since = None
-            return False
-
-        if self._bad_since is None:
-            self._bad_since = now
-            return False
-
-        if now - self._bad_since < 2.0:
-            return False  # give it a moment before acting
-
-        self.log.out(f"Looks stuck: state={state}, errors={errs}, in={rate_in}, out={rate_out}, age={age:.1f}s")
-        # --- corrective action ---
-        self._last_fix = now
-        self._bad_since = now  # reset window so we don't thrash
-
-        try:
-            mpv.stop()
-        except Exception as e:
-            self.log.err(f"Failed to stop mpv: {e}")
-
-        try:
-            if hasattr(mpv, "loadfile_now"):
-                mpv.loadfile_now(current_url)
-            else:
-                mpv.loadfile(current_url)
-        except Exception as e:
-            self.log.err(f"Failed to load current url {current_url}: {e}")
-
-        # Optional: cancel a local connection if TVH reports one.
-        try:
-            conns = self.tvh.connections()
-            for c in conns.get("entries", []):
-                if c.get("peer") in ("127.0.0.1", "::1"):
-                    cid = c.get("id")
-                    if isinstance(cid, int):
-                        self.tvh.cancel_connections([cid])
-                        break
-        except Exception as e:
-            self.log.err(f"Failed to cancel connections: {e}")
-
-        return True
+            time.sleep(self.interval_s if not took_action else 0.1)
 
 def main():
     """Command-line interface for the scanner."""

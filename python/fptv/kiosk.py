@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
-from typing import List, Optional
+from typing import List
 
 import pygame
 
@@ -15,7 +15,7 @@ from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
-from fptv.tvh import Channel, TVHeadendScanner, ScanConfig, TVHWatchdog
+from fptv.tvh import Channel, TVHeadendScanner, ScanConfig, WatchdogWorker
 
 MPV_FORMAT_FLAG = 3
 
@@ -178,29 +178,24 @@ class FPTV:
         tuning_started_at = 0.0
         tune_attempts = 0
 
-        watchdog = TVHWatchdog(self.tvh, ua_tag=MPV_USERAGENT)
-        next_watchdog_at = 0.0
-
-        def should_expect_stream() -> bool:
-            return ((mode in (Screen.PLAY, Screen.TUNE)) and
-                    (active_url is not None) and
-                    (not self.mpv.is_paused()))
+        watch = WatchdogWorker(self.tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
+        watch.start()
 
         self.poller.start()
 
-        last_status: Optional[TVHStatus] = None
-        missing_since: Optional[float] = None
-        stuck_since: Optional[float] = None
-
         running = True
-        last_frame_at = time.time()
         clock = pygame.time.Clock()
 
         while running:
             clock.tick(60)
 
-            try:
-                ev = self.event_queue.get_nowait()
+            # Drain queue
+            while True:
+                try:
+                    ev = self.event_queue.get_nowait()
+                except Empty:
+                    break
+
                 if ev == Event.QUIT:
                     running = False
 
@@ -242,25 +237,15 @@ class FPTV:
                         pending_name = f"Channel: {channel.name}"
                         debounce_deadline = time.time() + DEBOUNCE_S
 
-            except Empty:
-                pass
-
             # Render
             init_viewport(self.w, self.h)
             now = time.time()
-
-            try:
-                last_status = self.tvh_status_q.get_nowait()
-            except Exception:
-                pass
 
             if mode in (Screen.PLAY, Screen.TUNE):
                 clear_screen()
 
                 # Render mpv if it has a new frame ready.
                 did_render = self.mpv.maybe_render(self.w, self.h)
-                if did_render:
-                    last_frame_at = now
 
                 # Overlays (channel name / volume / messages)
                 self.overlays.tick()
@@ -277,6 +262,7 @@ class FPTV:
                     tuning_started_at = now
                     tune_attempts = 0
                     mode = Screen.TUNE
+                    force_flip = True
 
                 # If we got *any* new frame while tuning, consider the tune successful.
                 if mode == Screen.TUNE and did_render and (now - tuning_started_at) > 0.2:
@@ -291,6 +277,7 @@ class FPTV:
                         self.overlays.set_channel_name("Retrying…")
                         if active_url:
                             self.mpv.loadfile_now(active_url)
+                        force_flip = True
                     else:
                         self.log.out("Tune failed; returning to menu")
                         self.overlays.set_channel_name("No signal")
@@ -298,48 +285,27 @@ class FPTV:
                         mode = Screen.MENU
                         force_flip = True
 
-                if active_url and last_status and last_status.ok:
-                    expecting = should_expect_stream()
+                # --- publish minimal state to watchdog worker (EVERY FRAME is fine; it's just assignments) ---
+                watch.expecting = (mode in (Screen.TUNE, Screen.PLAY))
+                watch.current_url = active_url
+                watch.tuning_started_at = tuning_started_at
 
-                    ours = watchdog.find_our_subscription(last_status.subs)
+                # --- drain watchdog actions ---
+                while True:
+                    try:
+                        action, url, reason = watch.actions.get_nowait()
+                    except Empty:
+                        break
 
-                    # --- Case: expecting but no subscription ---
-                    if expecting and not ours:
-                        if missing_since is None:
-                            missing_since = now
-                        elif now - missing_since > 2.0:
-                            self.log.out(f"[watchdog] no subscription for {now - missing_since:.1f}s; reloading")
-                            missing_since = now
-                            tune_attempts = min(tune_attempts + 1, MAX_TUNE_RETRIES)
-                            self.mpv.loadfile_now(active_url)
-                            self.overlays.set_channel_name("Recovering stream…")
-                            force_flip = True
-                    else:
-                        missing_since = None
+                    if action == "reload" and url:
+                        self.log.out(f"Watchdog reload: {reason}")
+                        self.mpv.stop()
+                        self.mpv.loadfile_now(url)
+                        tuning_started_at = time.time()
+                        mode = Screen.TUNE
+                        force_flip = True
 
-                    # --- Case: subscription exists but looks stuck ---
-                    if ours:
-                        state = (ours.get("state") or "").lower()
-                        errs = int(ours.get("errors") or 0)
-                        rate_in = int(ours.get("in") or 0)
-                        rate_out = int(ours.get("out") or 0)
-
-                        looks_stuck = (state == "bad") or (errs > 0) or (rate_in == 0 and rate_out == 0)
-
-                        if looks_stuck and expecting:
-                            if stuck_since is None:
-                                stuck_since = now
-                            elif now - stuck_since > 2.0:
-                                self.log.out(
-                                    f"[watchdog] stuck (state={state}, errs={errs}, in={rate_in}, out={rate_out}); reloading")
-                                stuck_since = now
-                                self.mpv.loadfile_now(active_url)
-                                self.overlays.set_channel_name("Recovering stream…")
-                                force_flip = True
-                        else:
-                            stuck_since = None
-
-                # Present a new frame if mpv rendered, or if we need to show overlay/menu changes.
+                # --- PRESENT (this must not be inside the watchdog loop) ---
                 if did_render or force_flip:
                     pygame.display.flip()
                     self.mpv.report_swap()
