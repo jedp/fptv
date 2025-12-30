@@ -28,6 +28,7 @@ MPV_RENDER_API_TYPE_OPENGL = b"opengl"
 # mpv_render_update_flag values
 MPV_RENDER_UPDATE_FRAME = 1 << 00
 
+MPV_NETWORK_TIMEOUT_S = 30
 MPV_DEBOUNCE_PLAY_S = 0.150
 MPV_MIN_SWITCH_GAP_S = 0.35  # min time between real loadfile calls
 MPV_STOP_SETTLE_s = 0.25  # pause after stop to let server notice close
@@ -207,7 +208,7 @@ class EmbeddedMPV:
 
         # Tag all our requests.
         self._set_opt("user-agent", MPV_USERAGENT)
-        self._set_opt("network-timeout", "30")
+        self._set_opt("network-timeout", str(MPV_NETWORK_TIMEOUT_S))
 
         # Critical: prevent mpv from opening vo=gpu/drm/sdl, which fights SDL/KMS.
         self._set_opt("vo", "libmpv")
@@ -232,7 +233,7 @@ class EmbeddedMPV:
         self._set_opt("interpolation", "no")  # Can toggle if necessary. Keeping it simple ('no') for now.
 
         # Helpful defaults for your kiosk use-case.
-        self._set_opt("keep-open", "yes")
+        self._set_opt("keep-open", "no")
         self._set_opt("idle", "yes")
 
         # Pi/KMS friendliness
@@ -242,7 +243,7 @@ class EmbeddedMPV:
         self._set_opt("vd-lavc-dr", "no")
 
         # YouTube: depends on build/config; harmless if unused.
-        self._set_opt("ytdl", "yes")
+        self._set_opt("ytdl", "no")
 
         rc = self._mpv.mpv_initialize(self._handle)
         if rc < 0:

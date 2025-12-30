@@ -109,6 +109,7 @@ class FPTV:
         force_flip = False
         watchdog = TVHWatchdog(self.tvh, ua_tag=MPV_USERAGENT)
         next_watchdog_at = 0.0
+        wait_until_ms = 0
         while running:
             pygame.event.pump()
 
@@ -159,7 +160,8 @@ class FPTV:
             # Render
             init_viewport(w, h)
 
-            if mode == Screen.PLAYING:
+
+            if wait_until_ms == 0 and mode == Screen.PLAYING:
                 clear_screen()
 
                 did_render = self.mpv.maybe_render(w, h)
@@ -178,7 +180,8 @@ class FPTV:
                     force_flip = False
                 else:
                     # If mpv produced no new frame, don't flip (avoids buffer ping-pong flicker)
-                    time.sleep(0.002)
+                    if wait_until_ms == 0:
+                        wait_until_ms = time.time() + 2
 
                 overlay_dirty = False
 
@@ -199,6 +202,11 @@ class FPTV:
                 clear_screen()
                 self.renderer.draw_fullscreen()
                 pygame.display.flip()
+
+
+            if wait_until_ms > 0:
+                if wait_until_ms >= time.time():
+                    wait_until_ms = 0
 
             self.mpv.tick()
             clock.tick(60)
