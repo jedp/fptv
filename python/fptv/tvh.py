@@ -63,7 +63,7 @@ class Channel:
 
 @dataclass
 class ScanConfig:
-    base_url: str = "http://localhost:9981"
+    base_url: str = "http://127.0.0.1:9981"
     net_name: str = "ATSC OTA"
     user: str = ""
     password: str = ""
@@ -83,7 +83,7 @@ class ScanConfig:
     def from_env(cls) -> ScanConfig:
         """Load configuration from environment variables."""
         return cls(
-            base_url=os.getenv("BASE_URL", "http://localhost:9981"),
+            base_url=os.getenv("BASE_URL", "http://127.0.0.1:9981"),
             net_name=os.getenv("NET_NAME", "ATSC OTA"),
             user=os.getenv("TVH_USER", ""),
             password=os.getenv("TVH_PASS", ""),

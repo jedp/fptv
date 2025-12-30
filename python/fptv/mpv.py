@@ -40,7 +40,7 @@ MPV_OPT_RENDER_API_TYPE_OPENGL = "opengl"
 # mpv_render_update_flag values
 MPV_RENDER_UPDATE_FRAME = 1 << 00
 
-MPV_DEBOUNCE_PLAY_S = 0.150
+MPV_DEBOUNCE_PLAY_S = 0.4
 MPV_MIN_SWITCH_GAP_S = 0.35  # min time between real loadfile calls
 MPV_STOP_SETTLE_s = 0.25  # pause after stop to let server notice close
 MPV_OPT_NETWORK_TIMEOUT_S = 30
