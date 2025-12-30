@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import os
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
-from typing import List
+from typing import List, Optional
 
 import pygame
 
@@ -55,13 +56,68 @@ class State:
             self.channels = []
 
 
+@dataclass
+class TVHStatus:
+    t: float
+    ok: bool
+    subs: dict | None = None
+    conns: dict | None = None
+    err: str | None = None
+
+
+class TVHPoller(threading.Thread):
+    """
+    Poll TVHeadend in a background thread and push latest status into a queue.
+
+    - Never blocks the render thread.
+    - Drops old status if the main thread is behind (keeps only the latest).
+    """
+
+    def __init__(self, tvh, out_queue: SimpleQueue, interval_s: float = 1.0):
+        super().__init__(daemon=True)
+        self.tvh = tvh
+        self.out_queue = out_queue
+        self.interval_s = interval_s
+        self._stop_evt = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            t0 = time.time()
+            try:
+                subs = self.tvh.subscriptions()
+                conns = self.tvh.connections()
+                status = TVHStatus(t=t0, ok=True, subs=subs, conns=conns)
+            except Exception as e:
+                status = TVHStatus(t=t0, ok=False, err=str(e))
+
+            # Push status; SimpleQueue can grow, so optionally drain older items:
+            try:
+                # keep queue small: drop stale statuses
+                while True:
+                    self.out_queue.get_nowait()
+            except Exception:
+                pass
+
+            self.out_queue.put(status)
+
+            # sleep remainder
+            dt = time.time() - t0
+            sleep_for = max(0.05, self.interval_s - dt)
+            self._stop_evt.wait(sleep_for)
+
+
 class FPTV:
     def __init__(self, screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
         self.w = screen_w
         self.h = screen_h
         self.log = Logger("fptv")
         self.event_queue = SimpleQueue()
+        self.tvh_status_q = SimpleQueue()
         self.tvh = TVHeadendScanner(ScanConfig.from_env())
+        self.poller = TVHPoller(self.tvh, self.tvh_status_q, interval_s=1.0)
         self.hw = FPTVHW(self.event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
 
@@ -101,7 +157,7 @@ class FPTV:
         # Startup: pause on test source; user presses to enter video mode.
         self.mpv.initialize()
         self.mpv.loadfile("av://lavfi:mandelbrot")
-        self.mpv.set_property_flag("pause", True)
+        self.mpv.pause()
 
         menu_surf = pygame.Surface((SCREEN_W, SCREEN_H))
 
@@ -125,6 +181,17 @@ class FPTV:
         watchdog = TVHWatchdog(self.tvh, ua_tag=MPV_USERAGENT)
         next_watchdog_at = 0.0
 
+        def should_expect_stream() -> bool:
+            return ((mode in (Screen.PLAY, Screen.TUNE)) and
+                    (active_url is not None) and
+                    (not self.mpv.is_paused()))
+
+        self.poller.start()
+
+        last_status: Optional[TVHStatus] = None
+        missing_since: Optional[float] = None
+        stuck_since: Optional[float] = None
+
         running = True
         last_frame_at = time.time()
         clock = pygame.time.Clock()
@@ -140,7 +207,7 @@ class FPTV:
                 if ev == Event.PRESS:
                     if mode == Screen.MENU:
                         # Start video mode. If we don't have an active channel yet, tune to current selection.
-                        self.mpv.set_property_flag("pause", False)
+                        self.mpv.resume()
                         if self.state.channels:
                             ch = self.state.channels[self.state.browse_index]
                             pending_name = f"Channel: {ch.name}"
@@ -155,7 +222,7 @@ class FPTV:
                         force_flip = True
                     else:
                         mode = Screen.MENU
-                        self.mpv.set_property_flag("pause", True)
+                        self.mpv.pause()
                         force_flip = True
 
                 if ev == Event.ROT_L or ev == Event.ROT_R:
@@ -181,6 +248,11 @@ class FPTV:
             # Render
             init_viewport(self.w, self.h)
             now = time.time()
+
+            try:
+                last_status = self.tvh_status_q.get_nowait()
+            except Exception:
+                pass
 
             if mode in (Screen.PLAY, Screen.TUNE):
                 clear_screen()
@@ -222,31 +294,50 @@ class FPTV:
                     else:
                         self.log.out("Tune failed; returning to menu")
                         self.overlays.set_channel_name("No signal")
-                        self.mpv.set_property_flag("pause", True)
+                        self.mpv.pause()
                         mode = Screen.MENU
                         force_flip = True
 
-                # --- watchdog (1 Hz) ---
-                if active_url and now >= next_watchdog_at:
-                    # Only check TVH while tuning, or if we haven't rendered a new frame recently.
-                    should_check = (mode == Screen.TUNE) or ((now - last_frame_at) > 1.0)
+                if active_url and last_status and last_status.ok:
+                    expecting = should_expect_stream()
 
-                    if should_check:
-                        next_watchdog_at = now + WATCHDOG_EVERY_S  # or 2.0 / 5.0
-                        expecting = (mode in (Screen.TUNE, Screen.PLAY))
-                        if expecting and mode == Screen.TUNE and (now - tuning_started_at) < 1.0:
-                            expecting = False
+                    ours = watchdog.find_our_subscription(last_status.subs)
 
-                        t0 = time.time()
-                        if watchdog.check_and_fix(now=now, mpv=self.mpv, current_url=active_url, expecting=expecting):
+                    # --- Case: expecting but no subscription ---
+                    if expecting and not ours:
+                        if missing_since is None:
+                            missing_since = now
+                        elif now - missing_since > 2.0:
+                            self.log.out(f"[watchdog] no subscription for {now - missing_since:.1f}s; reloading")
+                            missing_since = now
+                            tune_attempts = min(tune_attempts + 1, MAX_TUNE_RETRIES)
+                            self.mpv.loadfile_now(active_url)
                             self.overlays.set_channel_name("Recovering stream…")
                             force_flip = True
-                        dt = time.time() - t0
-                        if dt > 0.05:
-                            self.log.out(f"watchdog took {dt:.3f}s")
                     else:
-                        # Defer without doing any work (keeps watchdog from hammering TVH).
-                        next_watchdog_at = now + 0.25
+                        missing_since = None
+
+                    # --- Case: subscription exists but looks stuck ---
+                    if ours:
+                        state = (ours.get("state") or "").lower()
+                        errs = int(ours.get("errors") or 0)
+                        rate_in = int(ours.get("in") or 0)
+                        rate_out = int(ours.get("out") or 0)
+
+                        looks_stuck = (state == "bad") or (errs > 0) or (rate_in == 0 and rate_out == 0)
+
+                        if looks_stuck and expecting:
+                            if stuck_since is None:
+                                stuck_since = now
+                            elif now - stuck_since > 2.0:
+                                self.log.out(
+                                    f"[watchdog] stuck (state={state}, errs={errs}, in={rate_in}, out={rate_out}); reloading")
+                                stuck_since = now
+                                self.mpv.loadfile_now(active_url)
+                                self.overlays.set_channel_name("Recovering stream…")
+                                force_flip = True
+                        else:
+                            stuck_since = None
 
                 # Present a new frame if mpv rendered, or if we need to show overlay/menu changes.
                 if did_render or force_flip:
@@ -271,6 +362,8 @@ class FPTV:
 
     def shutdown(self) -> int:
         try:
+            print("Stopping TVH poller.")
+            self.poller.stop()
             print("Releasing GPIOs.")
             self.hw.close()
             print("Shutting down player.")
