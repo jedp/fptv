@@ -8,10 +8,22 @@ from ctypes import (
 from ctypes.util import find_library
 
 from fptv.gl import mpv_opengl_get_proc_address_fn
+from fptv.log import Logger
 
 MPV_SOCK = "/tmp/fptv-mpv.sock"
 
+# mpv_format enum values (from mpv/client.h)
+MPV_FORMAT_NONE = 0
+MPV_FORMAT_STRING = 1
+MPV_FORMAT_OSD_STRING = 2
 MPV_FORMAT_FLAG = 3
+MPV_FORMAT_INT64 = 4
+MPV_FORMAT_DOUBLE = 5
+MPV_FORMAT_NODE = 6
+MPV_FORMAT_NODE_ARRAY = 7
+MPV_FORMAT_NODE_MAP = 8
+MPV_FORMAT_BYTE_ARRAY = 9
+
 MPV_USERAGENT = "fptv/embedded-mpv"
 
 # mpv_render_param_type values (from render.h)
@@ -23,15 +35,20 @@ MPV_RENDER_PARAM_FLIP_Y = 4
 MPV_RENDER_PARAM_ADVANCED_CONTROL = 10
 
 # Predefined API type string (from render.h)
-MPV_RENDER_API_TYPE_OPENGL = b"opengl"
+MPV_OPT_RENDER_API_TYPE_OPENGL = "opengl"
 
 # mpv_render_update_flag values
 MPV_RENDER_UPDATE_FRAME = 1 << 00
 
-MPV_NETWORK_TIMEOUT_S = 30
 MPV_DEBOUNCE_PLAY_S = 0.150
 MPV_MIN_SWITCH_GAP_S = 0.35  # min time between real loadfile calls
 MPV_STOP_SETTLE_s = 0.25  # pause after stop to let server notice close
+MPV_OPT_NETWORK_TIMEOUT_S = 30
+
+MPV_FLAG_PAUSE = "pause"
+
+class MPVError(RuntimeError):
+    pass
 
 
 class mpv_render_param(Structure):
@@ -106,6 +123,7 @@ class EmbeddedMPV:
     """
 
     def __init__(self) -> None:
+        self.log = Logger("mpv")
         self._mpv = _load_cdll(["mpv", "libmpv.so.2", "libmpv.so.1", "libmpv.so"])
         self._egl = _try_load_cdll(["EGL", "libEGL.so.1", "libEGL.so"])
         self._sdl = _try_load_cdll(["SDL2", "libSDL2-2.0.so.0", "libSDL2.so"])
@@ -161,6 +179,14 @@ class EmbeddedMPV:
         self._mpv.mpv_set_option_string.argtypes = [c_void_p, c_char_p, c_char_p]
         self._mpv.mpv_set_option_string.restype = c_int
 
+        # int mpv_get_property(mpv_handle *ctx, const char *name, mpv_format format, void *data);
+        self._mpv.mpv_get_property.argtypes = [c_void_p, c_char_p, c_int, c_void_p]
+        self._mpv.mpv_get_property.restype = c_int
+
+        # char *mpv_get_property_string(mpv_handle *ctx, const char *name);
+        self._mpv.mpv_get_property_string.argtypes = [c_void_p, c_char_p]
+        self._mpv.mpv_get_property_string.restype = c_void_p  # returns char* you must mpv_free()
+
         self._mpv.mpv_set_property.argtypes = [c_void_p, c_char_p, c_int, c_void_p]
         self._mpv.mpv_set_property.restype = c_int
 
@@ -212,7 +238,7 @@ class EmbeddedMPV:
 
         # Tag all our requests.
         self._set_opt("user-agent", MPV_USERAGENT)
-        self._set_opt("network-timeout", str(MPV_NETWORK_TIMEOUT_S))
+        self._set_opt("network-timeout", str(str(MPV_OPT_NETWORK_TIMEOUT_S)))
 
         # Critical: prevent mpv from opening vo=gpu/drm/sdl, which fights SDL/KMS.
         self._set_opt("vo", "libmpv")
@@ -241,7 +267,7 @@ class EmbeddedMPV:
         self._set_opt("idle", "yes")
 
         # Pi/KMS friendliness
-        self._set_opt("gpu-api", "opengl")
+        self._set_opt("gpu-api", MPV_OPT_RENDER_API_TYPE_OPENGL)
         self._set_opt("opengl-es", "yes")
         self._set_opt("hwdec", "no")
         self._set_opt("vd-lavc-dr", "no")
@@ -254,7 +280,7 @@ class EmbeddedMPV:
             raise RuntimeError(f"mpv_initialize() failed rc={rc}")
 
         # Build render context params (OpenGL backend).
-        api_type = c_char_p(MPV_RENDER_API_TYPE_OPENGL)
+        api_type = c_char_p(MPV_OPT_RENDER_API_TYPE_OPENGL.encode("utf-8"))
 
         init_params = mpv_opengl_init_params(
             get_proc_address=self._cb_get_proc,
@@ -281,19 +307,17 @@ class EmbeddedMPV:
         # Register update callback ASAP. mpv will invoke it immediately once set.
         self._mpv.mpv_render_context_set_update_callback(self._render_ctx, self._cb_update, None)
 
+    def pause(self) -> int:
+        return self._set_property_flag(MPV_FLAG_PAUSE.encode("utf-8"), True)
+
+    def resume(self) -> int:
+        return self._set_property_flag(MPV_FLAG_PAUSE.encode("utf-8"), False)
+
+    def is_paused(self) -> bool:
+        return self._get_property_flag(MPV_FLAG_PAUSE.encode("utf-8"))
+
     def stop(self):
         self._exec("stop")
-
-    def set_property_flag(self, name: str, value: bool) -> int:
-        v = ctypes.c_int(1 if value else 0)
-        rc = self._mpv.mpv_set_property(
-            self._handle,
-            name.encode("utf-8"),
-            MPV_FORMAT_FLAG,
-            ctypes.byref(v),
-        )
-        print(f"MPV set_property_flag: {name}={value} rc={rc}")
-        return rc
 
     def report_swap(self) -> None:
         self._mpv.mpv_render_context_report_swap(self._render_ctx)
@@ -320,7 +344,7 @@ class EmbeddedMPV:
                 return False
 
             self._exec("loadfile", url, "replace")
-            self.set_property_flag("pause", False)
+            self._set_property_flag(MPV_FLAG_PAUSE.encode("utf-8"), False)
             self._current_url = url
             # prevent immediate re-tune storms
             self._switch_inflight_until = now + self._min_switch_gap_s
@@ -434,9 +458,23 @@ class EmbeddedMPV:
             if ev.event_id == 0:  # MPV_EVENT_NONE
                 break
 
-    def _set_opt(self, name: str, value: str) -> None:
+    def _set_opt(self, name: str, value: str) -> int:
         rc = self._mpv.mpv_set_option_string(self._handle, name.encode("utf-8"), value.encode("utf-8"))
         # ignore rc for “best-effort” options; you can assert if you prefer
+        return rc
+
+    def _get_property_flag(self, name: bytes) -> bool:
+        v = c_int()  # FLAG uses int (0/1)
+        err = self._mpv.mpv_get_property(self._handle, name, MPV_FORMAT_FLAG, byref(v))
+        if err < 0 or err > 1:
+            self.log.err(f"mpv_get_property('pause') failed: {err}")
+        return bool(v.value)
+
+    def _set_property_flag(self, name: bytes, value: bool) -> int:
+        v = ctypes.c_int(1 if value else 0)
+        rc = self._mpv.mpv_set_property(self._handle, name, MPV_FORMAT_FLAG, byref(v))
+        print(f"MPV set_property_flag: {name}={value} rc={rc}")
+        return rc
 
     def _exec(self, *args: str) -> int:
         if not self._handle:

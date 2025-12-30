@@ -1769,12 +1769,13 @@ class TVHWatchdog:
 
         self.log.out(f"Watchdog initialized with UA tag {self.ua_tag}")
 
-    def _find_our_subscription(self, subs: dict[str, Any]) -> Optional[dict[str, Any]]:
+    def find_our_subscription(self, subs: dict[str, Any]) -> Optional[dict[str, Any]]:
         for e in subs.get("entries", []):
+            useragent = (e.get("useragent") or "")
             client = (e.get("client") or "")
             title = (e.get("title") or "")
             # Depending on TVH version/config, your tag may appear in client; title often just "HTTP".
-            if self.ua_tag in client or self.ua_tag in title:
+            if self.ua_tag in useragent or self.ua_tag in client or self.ua_tag in title:
                 return e
         return None
 
@@ -1805,7 +1806,7 @@ class TVHWatchdog:
         except Exception:
             return False
 
-        ours = self._find_our_subscription(subs)
+        ours = self.find_our_subscription(subs)
 
         # --- Case A: expected stream but no subscription at all ---
         if not ours:
