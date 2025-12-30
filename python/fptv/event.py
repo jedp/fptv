@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+from dataclasses import dataclass
 from enum import Enum, auto
 
 
@@ -10,3 +9,15 @@ class Event(Enum):
     LONG_PRESS = auto()
     RELEASE = auto()
     QUIT = auto()  # exit
+
+
+@dataclass
+class HwEvent:
+    source: str
+    event: Event
+
+    def __str__(self):
+        return f"HwEvent(source={self.source}, event={self.event})"
+
+    def __repr__(self):
+        return self.__str__()

@@ -10,7 +10,7 @@ from typing import List
 import pygame
 
 from fptv.event import Event
-from fptv.hw import FPTVHW
+from fptv.hw import HwEventBinding
 from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
@@ -118,7 +118,7 @@ class FPTV:
         self.tvh_status_q = SimpleQueue()
         self.tvh = TVHeadendScanner(ScanConfig.from_env())
         self.poller = TVHPoller(self.tvh, self.tvh_status_q, interval_s=1.0)
-        self.hw = FPTVHW(self.event_queue)
+        self.hw = HwEventBinding(self.event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
 
         pygame.init()
@@ -192,9 +192,11 @@ class FPTV:
             # Drain queue
             while True:
                 try:
-                    ev = self.event_queue.get_nowait()
+                    hwEvent = self.event_queue.get_nowait()
                 except Empty:
                     break
+
+                ev = hwEvent.event
 
                 if ev == Event.QUIT:
                     running = False
