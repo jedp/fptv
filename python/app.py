@@ -15,7 +15,11 @@ You might have to normalize the display first:
     sudo chvt 1
 """
 if __name__ == "__main__":
+    import faulthandler, signal
     import fptv.kiosk
+
+    faulthandler.enable()
+    faulthandler.register(signal.SIGUSR1)
 
     app = fptv.kiosk.FPTV()
     exit_code = 0
@@ -26,7 +30,7 @@ if __name__ == "__main__":
         if exit_code == 0:
             print("App shutdown successful")
         else:
-            print(f"App shutdown returned code {result}")
+            print(f"App shutdown returned code {exit_code}")
 
     raise (SystemExit(exit_code))
 
