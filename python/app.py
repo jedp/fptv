@@ -22,15 +22,29 @@ if __name__ == "__main__":
     faulthandler.register(signal.SIGUSR1)
 
     app = fptv.kiosk.FPTV()
-    exit_code = 0
-    try:
-        app.mainloop()
-    except KeyboardInterrupt:
+
+
+    def signal_handler(signum, frame):
         exit_code = app.shutdown()
         if exit_code == 0:
             print("App shutdown successful")
         else:
             print(f"App shutdown returned code {exit_code}")
+        raise SystemExit(exit_code)
 
-    raise (SystemExit(exit_code))
 
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGHUP, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        app.mainloop()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        try:
+            app.shutdown()
+        except Exception as shutdown_err:
+            print(f"Error during shutdown: {shutdown_err}")
+        raise
