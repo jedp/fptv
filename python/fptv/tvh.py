@@ -140,20 +140,22 @@ class TVHeadendScanner:
         resp = None
         for i in range(attempts):
             try:
-                resp = requests.request(method, url, **kwargs)
+                with requests.request(method, url, **kwargs) as resp:
+
+                    if resp.status_code >= 500 and i < attempts - 1:
+                        time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
+                        continue
+
+                    return resp
+
             except requests.RequestException:
                 if i == attempts - 1:
                     raise
+
                 time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
                 continue
 
-            if resp.status_code >= 500 and i < attempts - 1:
-                time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
-                continue
-
-            return resp
-
-        return resp  # pragma: no cover
+        return None
 
     def _get(self, endpoint: str, **kwargs) -> requests.Response:
         response = self._request("GET", endpoint, **kwargs)
