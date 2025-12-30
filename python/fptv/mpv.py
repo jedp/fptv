@@ -135,6 +135,10 @@ class EmbeddedMPV:
         self._switch_after = 0.0
         self._switch_inflight_until = 0.0
 
+        self._stage: str | None = None  # None | 'stop_wait'
+        self._stop_until = 0.0
+        self._next_url: str | None = None
+
         # tune these
         self._debounce_s = MPV_DEBOUNCE_PLAY_S
         self._min_switch_gap_s = MPV_MIN_SWITCH_GAP_S
@@ -297,17 +301,40 @@ class EmbeddedMPV:
     def tick(self) -> bool:
         """
         Call every frame.
-        Returns True if we *did* start a new tune (loadfile).
+        Returns True if we *initiated* a tune (either stop or loadfile).
+
+        This is intentionally non-blocking (no sleep), so the render loop can keep
+        calling mpv_render_context_render() regularly.
         """
         now = time.time()
 
+        # Stage 2: we already issued stop; wait a short settle window, then load.
+        if self._stage == "stop_wait":
+            if now < self._stop_until:
+                return False
+            url = self._next_url
+            self._next_url = None
+            self._stage = None
+
+            if not url or url == self._current_url:
+                return False
+
+            self._exec("loadfile", url, "replace")
+            self.set_property_flag("pause", False)
+            self._current_url = url
+            # prevent immediate re-tune storms
+            self._switch_inflight_until = now + self._min_switch_gap_s
+            return True
+
+        # Nothing queued.
         if not self._pending_url:
             return False
 
+        # Debounce/coalesce rapid selection changes.
         if now < self._switch_after:
             return False
 
-        # enforce a minimum gap between actual tunes
+        # Enforce a minimum gap between tune attempts.
         if now < self._switch_inflight_until:
             return False
 
@@ -318,16 +345,13 @@ class EmbeddedMPV:
         if url == self._current_url:
             return False
 
-        # Encourage old connection to close before opening the next
-        # (helps TVH under rapid channel twiddling)
+        # Stage 1: stop, then let the HTTP connection close a moment.
         self._exec("stop")
-        time.sleep(self._stop_settle_s)
+        self._stage = "stop_wait"
+        self._next_url = url
+        self._stop_until = now + self._stop_settle_s
 
-        self._exec("loadfile", url, "replace")
-        self.set_property_flag("pause", False)
-        self._current_url = url
-
-        # prevent immediate re-tune storms
+        # Reserve the "inflight" window starting now (includes settle time).
         self._switch_inflight_until = now + self._min_switch_gap_s
         return True
 
@@ -352,6 +376,12 @@ class EmbeddedMPV:
         self.initialize()
         self._pending_url = url
         self._switch_after = time.time() + self._debounce_s
+
+    def loadfile_now(self, url: str) -> None:
+        """Queue a tune immediately (no debounce). Useful for watchdog recovery."""
+        self.initialize()
+        self._pending_url = url
+        self._switch_after = 0.0
 
     def show_text(self, text: str, duration_ms: int = 1000) -> None:
         """Display mpv OSD text (great for a volume overlay)."""

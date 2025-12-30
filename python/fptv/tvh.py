@@ -1778,9 +1778,23 @@ class TVHWatchdog:
                 return e
         return None
 
-    def check_and_fix(self, *, now: float, mpv, current_url: str) -> bool:
+    def check_and_fix(
+            self,
+            *,
+            now: float,
+            mpv,
+            current_url: str,
+            expecting: bool = True,
+            missing_grace_s: float = 3.0,
+    ) -> bool:
         """
         Returns True if we took a corrective action.
+
+        This has two modes:
+          1) If a matching subscription exists and looks stuck (Bad / errors / 0 rate), we reload.
+          2) If we *expect* to be streaming but TVH shows **no matching subscription** for too long,
+             we also reload. (This is the case when TVH drops the subscription with
+             "No input detected".)
         """
         # Don’t spam TVH if you call this at 60fps.
         if now - self._last_fix < 1.0:
@@ -1792,10 +1806,41 @@ class TVHWatchdog:
             return False
 
         ours = self._find_our_subscription(subs)
-        if not ours:
-            self._bad_since = None
-            return False
 
+        # --- Case A: expected stream but no subscription at all ---
+        if not ours:
+            if not expecting:
+                self._bad_since = None
+                return False
+
+            if self._bad_since is None:
+                self._bad_since = now
+                return False
+
+            if now - self._bad_since < missing_grace_s:
+                return False
+
+            self.log.out(f"No matching subscription for {now - self._bad_since:.1f}s; reloading {current_url}")
+            self._last_fix = now
+            self._bad_since = now  # reset window so we don't thrash
+
+            try:
+                mpv.stop()
+            except Exception as e:
+                self.log.err(f"Failed to stop mpv: {e}")
+
+            try:
+                # Prefer immediate reload if available; fall back to loadfile.
+                if hasattr(mpv, "loadfile_now"):
+                    mpv.loadfile_now(current_url)
+                else:
+                    mpv.loadfile(current_url)
+            except Exception as e:
+                self.log.err(f"Failed to reload url {current_url}: {e}")
+
+            return True
+
+        # --- Case B: we have a subscription, but it looks stuck ---
         state = (ours.get("state") or "")
         errs = int(ours.get("errors") or 0)
         rate_in = int(ours.get("in") or 0)
@@ -1825,24 +1870,23 @@ class TVHWatchdog:
         self._last_fix = now
         self._bad_since = now  # reset window so we don't thrash
 
-        # 1) Ask mpv to drop and reload (usually enough)
         try:
             mpv.stop()
         except Exception as e:
             self.log.err(f"Failed to stop mpv: {e}")
-            pass
+
         try:
-            mpv.loadfile(current_url)
+            if hasattr(mpv, "loadfile_now"):
+                mpv.loadfile_now(current_url)
+            else:
+                mpv.loadfile(current_url)
         except Exception as e:
             self.log.err(f"Failed to load current url {current_url}: {e}")
-            pass
 
-        # 2) Optional: if TVH reports a connection id for us, cancel it.
-        #    Some setups won’t show HTTP connections here; if empty, just skip. :contentReference[oaicite:3]{index=3}
+        # Optional: cancel a local connection if TVH reports one.
         try:
             conns = self.tvh.connections()
             for c in conns.get("entries", []):
-                # Heuristic: local peer + same user. Customize if you want.
                 if c.get("peer") in ("127.0.0.1", "::1"):
                     cid = c.get("id")
                     if isinstance(cid, int):
@@ -1850,7 +1894,6 @@ class TVHWatchdog:
                         break
         except Exception as e:
             self.log.err(f"Failed to cancel connections: {e}")
-            pass
 
         return True
 
