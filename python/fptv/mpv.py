@@ -18,6 +18,7 @@ from fptv.log import Logger
 MPV_SOCK = "/tmp/fptv-mpv.sock"
 
 MPV_FORMAT_FLAG = 3
+MPV_USERAGENT= "fptv/embedded-mpv"
 
 # mpv_render_param_type values (from render.h)
 MPV_RENDER_PARAM_INVALID = 0
@@ -206,6 +207,8 @@ class EmbeddedMPV:
         if not self._handle:
             raise RuntimeError("mpv_create() failed")
 
+        # Tag all our requests.
+        self._set_opt("user-agent", MPV_USERAGENT)
         self._set_opt("network-timeout", "5")
 
         # Critical: prevent mpv from opening vo=gpu/drm/sdl, which fights SDL/KMS.

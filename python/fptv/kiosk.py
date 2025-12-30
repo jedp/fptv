@@ -11,15 +11,19 @@ import pygame
 from fptv.event import Event
 from fptv.hw import FPTVHW
 from fptv.log import Logger
-from fptv.mpv import EmbeddedMPV
+from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
-from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
+from fptv.tvh import Channel, TVHeadendScanner, ScanConfig, TVHWatchdog
 
 MPV_FORMAT_FLAG = 3
 
 FPTV_CAPTION = "fptv"
 ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
+
+DEBOUNCE_S = 0.150  # a feel-good number
+MIN_TUNE_INTERVAL_S = 0.35  # prevents hammering tvheadend/mpv
+WATCHDOG_EVERY_S = 1.0
 
 
 class Screen(Enum):
@@ -103,6 +107,8 @@ class FPTV:
         pending_name: str | None = None
         debounce_deadline = 0.0
         force_flip = False
+        watchdog = TVHWatchdog(self.tvh, ua_tag=MPV_USERAGENT)
+        next_watchdog_at = 0.0
         while running:
             pygame.event.pump()
 
@@ -173,6 +179,17 @@ class FPTV:
                 else:
                     # If mpv produced no new frame, don't flip (avoids buffer ping-pong flicker)
                     time.sleep(0.002)
+
+                overlay_dirty = False
+
+                # --- watchdog (1 Hz) ---
+                if pending_url and now >= next_watchdog_at:
+                    next_watchdog_at = now + WATCHDOG_EVERY_S
+                    self.log.out("Watchdog check")
+                    if watchdog.check_and_fix(now=now, mpv=self.mpv, current_url=pending_url):
+                        # Make the recovery visible (optional)
+                        overlay_dirty |= self.overlays.set_channel_name("Recovering stream…", seconds=1.0)
+                        force_flip = True
 
             else:
                 # MENU: draw menu into texture and present
