@@ -26,7 +26,7 @@ SCREEN_W = 800
 
 DEBOUNCE_S = 0.150  # a feel-good number
 MIN_TUNE_INTERVAL_S = 0.35  # prevents hammering tvheadend/mpv
-WATCHDOG_EVERY_S = 1.0
+WATCHDOG_EVERY_S = 3.0
 TUNE_TIMEOUT_S = 20.0
 MAX_TUNE_RETRIES = 2
 
@@ -126,6 +126,7 @@ class FPTV:
         next_watchdog_at = 0.0
 
         running = True
+        last_frame_at = time.time()
         clock = pygame.time.Clock()
 
         while running:
@@ -186,6 +187,8 @@ class FPTV:
 
                 # Render mpv if it has a new frame ready.
                 did_render = self.mpv.maybe_render(self.w, self.h)
+                if did_render:
+                    last_frame_at = now
 
                 # Overlays (channel name / volume / messages)
                 self.overlays.tick()
@@ -225,14 +228,25 @@ class FPTV:
 
                 # --- watchdog (1 Hz) ---
                 if active_url and now >= next_watchdog_at:
-                    next_watchdog_at = now + WATCHDOG_EVERY_S
-                    expecting = (mode in (Screen.TUNE, Screen.PLAY))
-                    # During the first ~1s after a tune command, it's normal to briefly have no subscription.
-                    if expecting and mode == Screen.TUNE and (now - tuning_started_at) < 1.0:
-                        expecting = False
-                    if watchdog.check_and_fix(now=now, mpv=self.mpv, current_url=active_url, expecting=expecting):
-                        self.overlays.set_channel_name("Recovering stream…")
-                        force_flip = True
+                    # Only check TVH while tuning, or if we haven't rendered a new frame recently.
+                    should_check = (mode == Screen.TUNE) or ((now - last_frame_at) > 1.0)
+
+                    if should_check:
+                        next_watchdog_at = now + WATCHDOG_EVERY_S  # or 2.0 / 5.0
+                        expecting = (mode in (Screen.TUNE, Screen.PLAY))
+                        if expecting and mode == Screen.TUNE and (now - tuning_started_at) < 1.0:
+                            expecting = False
+
+                        t0 = time.time()
+                        if watchdog.check_and_fix(now=now, mpv=self.mpv, current_url=active_url, expecting=expecting):
+                            self.overlays.set_channel_name("Recovering stream…")
+                            force_flip = True
+                        dt = time.time() - t0
+                        if dt > 0.05:
+                            self.log.out(f"watchdog took {dt:.3f}s")
+                    else:
+                        # Defer without doing any work (keeps watchdog from hammering TVH).
+                        next_watchdog_at = now + 0.25
 
                 # Present a new frame if mpv rendered, or if we need to show overlay/menu changes.
                 if did_render or force_flip:
@@ -248,6 +262,7 @@ class FPTV:
                 clear_screen()
                 self.renderer.draw_fullscreen()
                 pygame.display.flip()
+                self.mpv.report_swap()
 
             # Let mpv advance any pending tune (non-blocking)
             self.mpv.tick()
