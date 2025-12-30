@@ -261,9 +261,40 @@ $ curl -s --digest -u 'jed:i like pie' 'http://localhost:9981/api/mpegts/network
 
 journald.conf
 
-SystemMaxUse=200M
+```commandline
+[Journal]
+Storage=persistent
+#Compress=yes
+#Seal=yes
+#SplitMode=uid
+#SyncIntervalSec=5m
+#RateLimitIntervalSec=30s
+#RateLimitBurst=10000
+SystemMaxUse=100M
 SystemKeepFree=500M
+#SystemMaxFileSize=
+#SystemMaxFiles=100
+#RuntimeMaxUse=
+#RuntimeKeepFree=
+#RuntimeMaxFileSize=
+#RuntimeMaxFiles=100
 MaxRetentionSec=1month
+#MaxFileSec=1month
+#ForwardToSyslog=no
+#ForwardToKMsg=no
+#ForwardToConsole=no
+#ForwardToWall=yes
+#TTYPath=/dev/console
+#MaxLevelStore=debug
+#MaxLevelSyslog=debug
+#MaxLevelKMsg=notice
+#MaxLevelConsole=info
+#MaxLevelWall=emerg
+#MaxLevelSocket=debug
+#LineMax=48K
+#ReadKMsg=yes
+#Audit=yes
+```
 
 
 Credentials
@@ -287,8 +318,8 @@ Requires=tvheadend.service
 
 [Service]
 Type=oneshot
-User=jed
-Group=jed
+User=fptv
+Group=fptv
 
 # Optional: credentials live here
 EnvironmentFile=/etc/fptv-tvheadend-api.env
@@ -373,7 +404,18 @@ WantedBy=multi-user.target
 ```
 
 
-`sudo usermod -aG video,input,audio jed`
+# Create system user with no login shell and no home directory
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin fptv
+
+# Add to audio group for ALSA access
+sudo usermod -aG audio fptv
+
+# Also add to video group if needed for GPU/display access
+sudo usermod -aG video fptv
+
+# And input group for GPIO/evdev access
+sudo usermod -aG input fptv
+sudo usermod -aG gpio fptv
 
 /etc/systemd/system/fptv.service
 
@@ -386,7 +428,8 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=jed
+User=fptv
+Group=fptv
 SyslogIdentifier=fptv
 WorkingDirectory=/opt/fptv/python
 
@@ -405,6 +448,9 @@ Environment=PYTHONPYCACHEPREFIX=/var/cache/fptv/pycache
 Environment=XDG_CACHE_HOME=/var/cache/fptv
 Environment=XDG_STATE_HOME=/var/lib/fptv
 Environment=XDG_CONFIG_HOME=/var/lib/fptv
+
+# ALSA config maybe needs to be set explicitly?
+Environment=ALSA_CONFIG_PATH=/usr/share/alsa/alsa.conf
 
 # Keep display awake (console)
 ExecStartPre=/usr/bin/setterm --blank 0 --powerdown 0
@@ -437,7 +483,6 @@ sudo raspi-config
 
     Choose Console Autologin
 
-sudo usermod -aG video,render,input,audio jed
 
 sudo setterm --blank 0 --powerdown 0
 
