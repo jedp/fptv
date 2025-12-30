@@ -42,12 +42,13 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional, List, Set
+from typing import Callable, Iterable, Optional, List, Set, Any
 
 import requests
 from requests.auth import HTTPDigestAuth
 
 from fptv.log import Logger
+from fptv.mpv import MPV_USERAGENT
 
 
 def json_dumps(obj: object) -> str:
@@ -392,6 +393,16 @@ class TVHeadendScanner:
             return r.upper() == "OK"
         return False
 
+    def subscriptions(self) -> dict[str, Any]:
+        return self._get_json("status/subscriptions")
+
+    def connections(self) -> dict[str, Any]:
+        return self._get_json("status/connections")
+
+    def cancel_connections(self, ids: list[int] | str) -> dict[str, Any]:
+        # docs: if id='all' then all connections cancelled :contentReference[oaicite:2]{index=2}
+        return self._get_json("connections/cancel", id=ids)
+
     def debug_channel_service_mux_health(self, net_uuid: str) -> dict:
         mux_index = self.get_mux_index(net_uuid=net_uuid)
 
@@ -411,8 +422,8 @@ class TVHeadendScanner:
             "services": 0,
             "mux_missing": 0,
             "mux_unknown": 0,
-            "by_scan_result": {},   # e.g. {1: 51, 2: 0}
-            "by_enabled": {},       # e.g. {True: 51, False: 0}
+            "by_scan_result": {},  # e.g. {1: 51, 2: 0}
+            "by_enabled": {},  # e.g. {True: 51, False: 0}
         }
 
         for ch in self.get_channel_grid():
@@ -820,7 +831,8 @@ class TVHeadendScanner:
         v = params.get("multiplex_uuid") or params.get("mux_uuid")
         return v if isinstance(v, str) and v else None
 
-    def service_is_acceptable(self, service_uuid: str, *, net_uuid: str, mux_index: dict[str, dict]) -> tuple[bool, str]:
+    def service_is_acceptable(self, service_uuid: str, *, net_uuid: str, mux_index: dict[str, dict]) -> tuple[
+        bool, str]:
         """
         Returns (ok, reason_key_if_not_ok).
         reason_key must match keys in prune stats["reasons"].
@@ -1741,6 +1753,106 @@ class TVHeadendScanner:
 
         return True
 
+class TVHWatchdog:
+    """
+    “Soft” recovery:
+      - We only act on subscriptions that look like *ours* (by client User-Agent substring).
+      - If the subscription is stuck Bad / 0 in/out for too long, we restart the mpv load.
+      - Optionally, if TVH reports a matching connection id, we cancel just that connection.
+    """
+    def __init__(self, tvh: TVHeadendScanner, *, ua_tag: str = MPV_USERAGENT):
+        self.tvh = tvh
+        self.ua_tag = ua_tag
+        self.log = Logger("watchdog")
+        self._bad_since: Optional[float] = None
+        self._last_fix: float = 0.0
+
+        self.log.out(f"Watchdog initialized with UA tag {self.ua_tag}")
+
+    def _find_our_subscription(self, subs: dict[str, Any]) -> Optional[dict[str, Any]]:
+        for e in subs.get("entries", []):
+            client = (e.get("client") or "")
+            title = (e.get("title") or "")
+            # Depending on TVH version/config, your tag may appear in client; title often just "HTTP".
+            if self.ua_tag in client or self.ua_tag in title:
+                return e
+        return None
+
+    def check_and_fix(self, *, now: float, mpv, current_url: str) -> bool:
+        """
+        Returns True if we took a corrective action.
+        """
+        # Don’t spam TVH if you call this at 60fps.
+        if now - self._last_fix < 1.0:
+            return False
+
+        try:
+            subs = self.tvh.subscriptions()
+        except Exception:
+            return False
+
+        ours = self._find_our_subscription(subs)
+        if not ours:
+            self._bad_since = None
+            return False
+
+        state = (ours.get("state") or "")
+        errs = int(ours.get("errors") or 0)
+        rate_in = int(ours.get("in") or 0)
+        rate_out = int(ours.get("out") or 0)
+        started = int(ours.get("start") or 0)
+        age = now - started if started else 0.0
+
+        looks_stuck = (
+                state.lower() == "bad"
+                or errs > 0
+                or (age > 3.0 and rate_in == 0 and rate_out == 0)
+        )
+
+        if not looks_stuck:
+            self._bad_since = None
+            return False
+
+        if self._bad_since is None:
+            self._bad_since = now
+            return False
+
+        if now - self._bad_since < 2.0:
+            return False  # give it a moment before acting
+
+        self.log.out(f"Looks stuck: state={state}, errors={errs}, in={rate_in}, out={rate_out}, age={age:.1f}s")
+        # --- corrective action ---
+        self._last_fix = now
+        self._bad_since = now  # reset window so we don't thrash
+
+        # 1) Ask mpv to drop and reload (usually enough)
+        try:
+            mpv._command("stop")
+        except Exception as e:
+            self.log.err(f"Failed to stop mpv: {e}")
+            pass
+        try:
+            mpv.loadfile(current_url)
+        except Exception as e:
+            self.log.err(f"Failed to load current url {current_url}: {e}")
+            pass
+
+        # 2) Optional: if TVH reports a connection id for us, cancel it.
+        #    Some setups won’t show HTTP connections here; if empty, just skip. :contentReference[oaicite:3]{index=3}
+        try:
+            conns = self.tvh.connections()
+            for c in conns.get("entries", []):
+                # Heuristic: local peer + same user. Customize if you want.
+                if c.get("peer") in ("127.0.0.1", "::1"):
+                    cid = c.get("id")
+                    if isinstance(cid, int):
+                        self.tvh.cancel_connections([cid])
+                        break
+        except Exception as e:
+            self.log.err(f"Failed to cancel connections: {e}")
+            pass
+
+        return True
 
 def main():
     """Command-line interface for the scanner."""
