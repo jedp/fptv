@@ -89,14 +89,13 @@ class FPTV:
 
         # mpv embedded
         self.mpv.loadfile("av://lavfi:mandelbrot")  # easy test source
-        self.mpv.show_text("Video ready", 800)
+        self.mpv.service_loads()
 
         self.mpv.set_property_flag("pause", True)
 
         clock = pygame.time.Clock()
         running = True
 
-        channel_change_debouncing = time.time()
         mode: Screen = Screen.MENU
         channel_overlay_changed = False
         self.overlays.set_channel_name("Channel: None")
@@ -111,7 +110,6 @@ class FPTV:
                     ev = self.event_queue.get_nowait()
 
                     if ev == Event.PRESS:
-                        # Toggle
                         if mode == Screen.MENU:
                             mode = Screen.PLAYING
                             self.mpv.set_property_flag("pause", False)
@@ -126,14 +124,16 @@ class FPTV:
                             self.log.out("No channels available.")
                             continue
 
-                        i = self.state.browse_index + 1 if ev == Event.ROT_R else self.state.browse_index - 1
+                        i = self.state.browse_index + (1 if ev == Event.ROT_R else -1)
                         i = max(0, min(len(self.state.channels) - 1, i))
                         self.state.browse_index = i
-                        ch = self.state.channels[self.state.browse_index]
-                        channel_overlay_changed |= self.overlays.set_channel_name(f"Channel: {ch.name}")
-                        pending_index = self.state.browse_index
-                        # Debounce tuning change.
-                        tune_deadline_s = time.time() + 0.150
+                        ch = self.state.channels[i]
+
+                        # Update the text overlay on the screen
+                        channel_overlay_changed |= self.overlays.set_channel_name(f"Channel: {ch.name}", seconds=1.2)
+
+                        # Debounce channel change
+                        self.mpv.request_loadfile(ch.url)  # new method below
 
                         # Move volume controls to other encoder when it's wired up.
                         # delta = 1 if ev == Event.ROT_R else -1
@@ -152,6 +152,10 @@ class FPTV:
             if mode == Screen.PLAYING:
                 clear_screen()
 
+                tuned_now = self.mpv.service_loads()
+                if tuned_now:
+                    force_flip = True  # so overlay redraw shows even if mpv hasn't produced a frame yet
+
                 did_render = self.mpv.maybe_render(w, h, force=channel_overlay_changed)
                 self.overlays.tick()
                 self.overlays.draw()
@@ -160,12 +164,13 @@ class FPTV:
                 if pending_index is not None and now >= tune_deadline_s:
                     ch = self.state.channels[pending_index]
                     self.log.out(f"Tune to channel: {ch.name}")
-                    self.mpv.loadfile(ch.url)
-                    pending_index = None
+                    self.mpv._loadfile_now(ch.url)
+                    pending_index = 0
 
                 if did_render or channel_overlay_changed or force_flip:
                     pygame.display.flip()
                     self.mpv.report_swap()
+                    # Clear one-shot flags after presenting
                     channel_overlay_changed = False
                     force_flip = False
                 else:

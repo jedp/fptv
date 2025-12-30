@@ -130,7 +130,15 @@ class EmbeddedMPV:
         self._cb_get_proc = mpv_opengl_get_proc_address_fn(self._get_proc_address)
         self._cb_update = mpv_render_update_fn(self._on_mpv_update)
 
+        self._pending_url: Optional[str] = None
+        self._pending_deadline: float = 0.0
+        self._last_load_at: float = 0.0
+
+        self._debounce_s: float = 0.18   # how long user must stop twiddling
+        self._min_gap_s: float = 0.45    # don't start tunes more often than this
+
         self._bind_functions()
+
         print("MVP init complete")
 
     def _bind_functions(self) -> None:
@@ -194,6 +202,8 @@ class EmbeddedMPV:
         self._handle = c_void_p(self._mpv.mpv_create())
         if not self._handle:
             raise RuntimeError("mpv_create() failed")
+
+        self._set_opt("network-timeout", "5")
 
         # Critical: prevent mpv from opening vo=gpu/drm/sdl, which fights SDL/KMS.
         self._set_opt("vo", "libmpv")
@@ -292,19 +302,83 @@ class EmbeddedMPV:
 
         print("MPV shutdown complete.")
 
-    def loadfile(self, url: str) -> None:
-        """Play a URL (e.g., YouTube) inside the embedded renderer."""
+    def request_loadfile(self, url: str, *, debounce_s: Optional[float] = None) -> None:
+        """
+        Queue a tune request. Coalesces rapid changes; doesn't hit tvheadend/mpv immediately.
+        Call service_loads() each frame (or at least frequently) to apply when ready.
+        """
         self.initialize()
-        self._command("loadfile", url, "replace")
+        d = self._debounce_s if debounce_s is None else float(debounce_s)
+        now = time.time()
+
+        self._pending_url = url
+        self._pending_deadline = now + d
+
+
+    def service_loads(self) -> bool:
+        """
+        Apply any pending loadfile if debounce + rate limit allow it.
+        Returns True if we actually issued a loadfile (useful to force a flip).
+        """
+        if not self._pending_url:
+            return False
+
+        now = time.time()
+
+        # still within debounce window -> wait
+        if now < self._pending_deadline:
+            return False
+
+        # rate limit -> wait a bit more
+        if (now - self._last_load_at) < self._min_gap_s:
+            return False
+
+        url = self._pending_url
+        self._pending_url = None
+        self._pending_deadline = 0.0
+        self._last_load_at = now
+
+        # Optional but often helpful: stop current playback before replacing
+        # (reduces overlap / backend thrash)
+        self._exec("stop")
+        self._exec("playlist-clear")
+
+        # Replace current stream
+        rc = self._exec("loadfile", url, "replace")
+        if rc < 0:
+            # If desired: simple one-shot retry after a short delay
+            self._pending_url = url
+            self._pending_deadline = now + 0.35
+            return False
+
+        # Ensure not paused
+        self.set_property_flag("pause", False)
+        return True
+
+    def loadfile(self, url: str) -> None:
+        """
+        Safe default: schedule with debounce=0 (still respects min_gap),
+        so your app can keep calling loadfile() without bypassing protections.
+        """
+        self.request_loadfile(url, debounce_s=0.0)
+
+    def _loadfile_now(self, url: str) -> None:
+        """Immediate load (bypasses debounce/rate limit). Use sparingly."""
+        self.initialize()
+        self._exec("stop")
+        self._exec("playlist-clear")
+        self._exec("loadfile", url, "replace")
+        self.set_property_flag("pause", False)
+        self._last_load_at = time.time()
 
     def show_text(self, text: str, duration_ms: int = 1000) -> None:
         """Display mpv OSD text (great for a volume overlay)."""
         # show-text: args are (text, duration-ms[, level])
-        self._command("show-text", text, str(duration_ms))
+        self._exec("show-text", text, str(duration_ms))
 
     def add_volume(self, volume: int) -> None:
         """Adjust volume and show an overlay."""
-        self._command("add", "volume", str(volume))
+        self._exec("add", "volume", str(volume))
         # ${volume} expands inside mpv’s OSD text
         self.show_text(f"    Vol: ${volume}%", 800)
 
@@ -348,16 +422,11 @@ class EmbeddedMPV:
             if ev.event_id == 0:  # MPV_EVENT_NONE
                 break
 
-    # -------------
-    # Internals
-    # -------------
-
     def _set_opt(self, name: str, value: str) -> None:
         rc = self._mpv.mpv_set_option_string(self._handle, name.encode("utf-8"), value.encode("utf-8"))
         # ignore rc for “best-effort” options; you can assert if you prefer
 
-    def _command(self, *args: str) -> None:
-        """Call mpv_command with a NULL-terminated argv."""
+    def _exec(self, *args: str) -> int:
         if not self._handle:
             raise RuntimeError("MPV not initialized")
 
@@ -368,7 +437,7 @@ class EmbeddedMPV:
 
         rc = self._mpv.mpv_command(self._handle, argv)
         print(f"MPV command: {args}. Error code: {rc}")
-        # rc < 0 indicates an error; for a starter kit we keep it simple
+        return rc
 
     def _on_mpv_update(self, _ctx: c_void_p) -> None:
         # IMPORTANT: don't call mpv APIs here. Just signal your main loop.
