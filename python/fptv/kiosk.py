@@ -89,7 +89,6 @@ class FPTV:
 
         # mpv embedded
         self.mpv.loadfile("av://lavfi:mandelbrot")  # easy test source
-        self.mpv.service_loads()
 
         self.mpv.set_property_flag("pause", True)
 
@@ -101,6 +100,9 @@ class FPTV:
         self.overlays.set_channel_name("Channel: None")
         tune_deadline_s = 0.0
         pending_index = None
+        pending_url: str | None = None
+        pending_name: str | None = None
+        debounce_deadline = 0.0
         force_flip = False
         while running:
             pygame.event.pump()
@@ -129,11 +131,14 @@ class FPTV:
                         self.state.browse_index = i
                         ch = self.state.channels[i]
 
-                        # Update the text overlay on the screen
-                        channel_overlay_changed |= self.overlays.set_channel_name(f"Channel: {ch.name}", seconds=1.2)
+                        # 1) Update overlay immediately
+                        pending_name = f"Channel: {ch.name}"
+                        overlay_changed = self.overlays.set_channel_name(pending_name)
+                        force_flip |= overlay_changed  # show it right away even if video hasn't updated
 
-                        # Debounce channel change
-                        self.mpv.request_loadfile(ch.url)  # new method below
+                        # 2) Debounce the actual tune
+                        pending_url = ch.url
+                        debounce_deadline = time.time() + 0.150
 
                         # Move volume controls to other encoder when it's wired up.
                         # delta = 1 if ev == Event.ROT_R else -1
@@ -152,20 +157,19 @@ class FPTV:
             if mode == Screen.PLAYING:
                 clear_screen()
 
-                tuned_now = self.mpv.service_loads()
-                if tuned_now:
-                    force_flip = True  # so overlay redraw shows even if mpv hasn't produced a frame yet
+                #tuned_now = self.mpv.service_loads()
+                #if tuned_now:
+                #    force_flip = True  # so overlay redraw shows even if mpv hasn't produced a frame yet
 
                 did_render = self.mpv.maybe_render(w, h, force=channel_overlay_changed)
                 self.overlays.tick()
                 self.overlays.draw()
 
                 now = time.time()
-                if pending_index is not None and now >= tune_deadline_s:
-                    ch = self.state.channels[pending_index]
-                    self.log.out(f"Tune to channel: {ch.name}")
-                    self.mpv._loadfile_now(ch.url)
-                    pending_index = 0
+                if pending_url and now >= debounce_deadline:
+                    self.log.out(f"Tune to channel: {pending_name}")
+                    self.mpv.loadfile(pending_url)  # see next section
+                    pending_url = None
 
                 if did_render or channel_overlay_changed or force_flip:
                     pygame.display.flip()
@@ -186,6 +190,7 @@ class FPTV:
                 self.renderer.draw_fullscreen()
                 pygame.display.flip()
 
+            self.mpv.tick()
             clock.tick(60)
 
         return self.shutdown()

@@ -130,12 +130,15 @@ class EmbeddedMPV:
         self._cb_get_proc = mpv_opengl_get_proc_address_fn(self._get_proc_address)
         self._cb_update = mpv_render_update_fn(self._on_mpv_update)
 
-        self._pending_url: Optional[str] = None
-        self._pending_deadline: float = 0.0
-        self._last_load_at: float = 0.0
+        self._pending_url: str | None = None
+        self._current_url: str | None = None
+        self._switch_after = 0.0
+        self._switch_inflight_until = 0.0
 
-        self._debounce_s: float = 0.18   # how long user must stop twiddling
-        self._min_gap_s: float = 0.45    # don't start tunes more often than this
+        # tune these
+        self._debounce_s = 0.150
+        self._min_switch_gap_s = 0.35  # hard floor between real loadfile calls
+        self._stop_settle_s = 0.08  # tiny pause after stop to let server notice close
 
         self._bind_functions()
 
@@ -286,6 +289,42 @@ class EmbeddedMPV:
     def report_swap(self) -> None:
         self._mpv.mpv_render_context_report_swap(self._render_ctx)
 
+    def tick(self) -> bool:
+        """
+        Call every frame.
+        Returns True if we *did* start a new tune (loadfile).
+        """
+        now = time.time()
+
+        if not self._pending_url:
+            return False
+
+        if now < self._switch_after:
+            return False
+
+        # enforce a minimum gap between actual tunes
+        if now < self._switch_inflight_until:
+            return False
+
+        url = self._pending_url
+        self._pending_url = None
+
+        # no-op if it's already playing this url
+        if url == self._current_url:
+            return False
+
+        # Encourage old connection to close before opening the next
+        # (helps TVH under rapid channel twiddling)
+        self._exec("stop")
+        time.sleep(self._stop_settle_s)
+
+        self._exec("loadfile", url, "replace")
+        self._current_url = url
+
+        # prevent immediate re-tune storms
+        self._switch_inflight_until = now + self._min_switch_gap_s
+        return True
+
     def shutdown(self) -> None:
         """Free render context and destroy mpv core."""
         if self._render_ctx:
@@ -302,65 +341,11 @@ class EmbeddedMPV:
 
         print("MPV shutdown complete.")
 
-    def request_loadfile(self, url: str, *, debounce_s: Optional[float] = None) -> None:
-        """
-        Queue a tune request. Coalesces rapid changes; doesn't hit tvheadend/mpv immediately.
-        Call service_loads() each frame (or at least frequently) to apply when ready.
-        """
-        self.initialize()
-        d = self._debounce_s if debounce_s is None else float(debounce_s)
-        now = time.time()
-
-        self._pending_url = url
-        self._pending_deadline = now + d
-
-
-    def service_loads(self) -> bool:
-        """
-        Apply any pending loadfile if debounce + rate limit allow it.
-        Returns True if we actually issued a loadfile (useful to force a flip).
-        """
-        if not self._pending_url:
-            return False
-
-        now = time.time()
-
-        # still within debounce window -> wait
-        if now < self._pending_deadline:
-            return False
-
-        # rate limit -> wait a bit more
-        if (now - self._last_load_at) < self._min_gap_s:
-            return False
-
-        url = self._pending_url
-        self._pending_url = None
-        self._pending_deadline = 0.0
-        self._last_load_at = now
-
-        # Optional but often helpful: stop current playback before replacing
-        # (reduces overlap / backend thrash)
-        self._exec("stop")
-        self._exec("playlist-clear")
-
-        # Replace current stream
-        rc = self._exec("loadfile", url, "replace")
-        if rc < 0:
-            # If desired: simple one-shot retry after a short delay
-            self._pending_url = url
-            self._pending_deadline = now + 0.35
-            return False
-
-        # Ensure not paused
-        self.set_property_flag("pause", False)
-        return True
-
     def loadfile(self, url: str) -> None:
-        """
-        Safe default: schedule with debounce=0 (still respects min_gap),
-        so your app can keep calling loadfile() without bypassing protections.
-        """
-        self.request_loadfile(url, debounce_s=0.0)
+        """Coalesce rapid requests; latest wins."""
+        self.initialize()
+        self._pending_url = url
+        self._switch_after = time.time() + self._debounce_s
 
     def _loadfile_now(self, url: str) -> None:
         """Immediate load (bypasses debounce/rate limit). Use sparingly."""
