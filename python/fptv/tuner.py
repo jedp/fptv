@@ -29,7 +29,6 @@ class TunerStatus:
     state: TunerState
     channel_name: str
     message: str | None = None  # "Retrying…", "No signal", etc.
-    did_render: bool = False  # True if a frame was rendered this tick
 
 
 class Tuner:
@@ -53,8 +52,9 @@ class Tuner:
         tuner.tune_now(url, "Channel: PBS")
         
         # In render loop:
-        status = tuner.render_tick(width, height)
-        if status.did_render:
+        did_render = tuner.render_frame(width, height)
+        status = tuner.tick(did_render)
+        if did_render:
             pygame.display.flip()
             tuner.report_swap()
     """
@@ -167,28 +167,36 @@ class Tuner:
     # Rendering
     # -------------------------------------------------------------------------
 
-    def render_tick(self, width: int, height: int) -> TunerStatus:
+    def render_frame(self, width: int, height: int) -> bool:
         """
-        Render a frame and tick the tuner state machine.
+        Render a video frame to the current GL context.
         
-        Call once per frame in the render loop.
+        Call once per frame in the render loop, before tick().
         
         Returns:
-            TuneStatus with current state, any message, and whether a frame was rendered.
+            True if a new frame was rendered, False otherwise.
         """
-        did_render = False
+        if not self._mpv:
+            return False
+        return self._mpv.maybe_render(width, height)
+
+    def tick(self, did_render_frame: bool = False) -> TunerStatus:
+        """
+        Tick the tuner state machine and process pending commands.
+
+        Call once per frame, after render_frame().
+
+        Args:
+            did_render_frame: True if render_frame() returned True this tick
+
+        Returns:
+            TunerStatus with current state and any message for display.
+        """
         if self._mpv:
-            did_render = self._mpv.maybe_render(width, height)
             self._mpv.tick()  # process pending mpv commands
 
         # Run state machine
-        status = self._tick_state(did_render)
-        return TunerStatus(
-            state=status.state,
-            channel_name=status.channel_name,
-            message=status.message,
-            did_render=did_render,
-        )
+        return self._tick_state(did_render_frame)
 
     def report_swap(self) -> None:
         """Notify mpv that a buffer swap occurred. Call after pygame.display.flip()."""
