@@ -536,19 +536,58 @@ def draw_main_menu(
         surface.blit(text_surf, text_rect)
 
 
+def draw_subscreen_header(
+        surface: pygame.Surface,
+        font: pygame.font.Font,
+        back_selected: bool,
+        title: str | None = None,
+) -> int:
+    """
+    Draw a header with Back button (left) and optional title (right).
+
+    Args:
+        surface: Surface to draw on
+        font: Font for text
+        back_selected: True if Back button is selected (index -1)
+        title: Optional title to show on the right
+
+    Returns:
+        Header height in pixels
+    """
+    header_h = 60
+    pad_x = 20
+
+    # Background for header when Back is selected
+    if back_selected:
+        rect = pygame.Rect(0, 0, surface.get_width(), header_h)
+        pygame.draw.rect(surface, BG_SEL, rect)
+
+    # Back button (left)
+    back_fg = FG_SEL if back_selected else FG_ACCENT_BLUE
+    back_text = font.render("< Back", True, back_fg)
+    back_rect = back_text.get_rect(midleft=(pad_x, header_h // 2))
+    surface.blit(back_text, back_rect)
+
+    # Title (right, white)
+    if title:
+        title_text = font.render(title, True, FG_NORM)
+        title_rect = title_text.get_rect(midright=(surface.get_width() - pad_x, header_h // 2))
+        surface.blit(title_text, title_rect)
+
+    return header_h
+
+
 def draw_browse(
         surface: pygame.Surface,
         item_font: pygame.font.Font,
         channels: list,  # List[Channel]
-        selected: int,
+        selected: int,  # -1 = Back selected, 0+ = channel index
 ) -> None:
-    """Draw the channel browser with scrolling list."""
+    """Draw the channel browser with scrolling list. selected=-1 means Back."""
     surface.fill(BG_NORM)
 
-    # Header
-    header_font = item_font
-    header = header_font.render("Channels", True, FG_ACCENT_BLUE)
-    surface.blit(header, (20, 10))
+    # Header with Back button and title
+    header_h = draw_subscreen_header(surface, item_font, back_selected=(selected == -1), title="Channels")
 
     if not channels:
         # No channels message
@@ -557,29 +596,28 @@ def draw_browse(
         surface.blit(msg, msg_rect)
         return
 
-    # Calculate visible window
+    # Calculate visible window (only for channel items, not Back)
     h = surface.get_height()
-    header_h = 70
     line_h = 52
     visible = max(1, (h - header_h) // line_h)
     total = len(channels)
 
-    # Simple scroll: selection can move freely in visible area,
-    # window scrolls only when selection would go off-screen
+    # For scroll calculation, treat selected as channel index (0-based)
+    # selected == -1 means Back is selected, show top of list
+    channel_sel = max(0, selected)
+
     if total <= visible:
         start = 0
     else:
-        # Scroll when selection reaches bottom of visible area
-        start = max(0, selected - visible + 1)
-        # Don't scroll past the end
+        start = max(0, channel_sel - visible + 1)
         start = min(start, total - visible)
-    
+
     end = min(start + visible, total)
 
     y0 = header_h
     for row, idx in enumerate(range(start, end)):
         channel = channels[idx]
-        is_sel = (idx == selected)
+        is_sel = (idx == selected)  # Only highlight if this channel is selected (not Back)
         fg_color = FG_SEL if is_sel else FG_NORM
         bg_color = BG_SEL if is_sel else BG_NORM
 
@@ -598,16 +636,16 @@ def draw_about(
         title_font: pygame.font.Font,
         item_font: pygame.font.Font,
         info: dict[str, str],
+        back_selected: bool = False,
 ) -> None:
     """Draw the about screen with device information."""
     surface.fill(BG_NORM)
 
-    # Title
-    title = title_font.render("About", True, FG_ACCENT_BLUE)
-    surface.blit(title, (60, 40))
+    # Header with Back and title
+    header_h = draw_subscreen_header(surface, item_font, back_selected=back_selected, title="About")
 
     # Info lines
-    y = 160
+    y = header_h + 20
     line_h = 50
 
     for key, value in info.items():
@@ -625,15 +663,16 @@ def draw_scan(
         title_font: pygame.font.Font,
         item_font: pygame.font.Font,
         status: str = "Not implemented yet",
+        back_selected: bool = False,
 ) -> None:
     """Draw the scan screen (placeholder for now)."""
     surface.fill(BG_NORM)
 
-    title = title_font.render("Scan", True, FG_ACCENT_BLUE)
-    surface.blit(title, (60, 40))
+    # Header with Back and title
+    header_h = draw_subscreen_header(surface, item_font, back_selected=back_selected, title="Scan")
 
     msg = item_font.render(status, True, FG_NORM)
-    msg_rect = msg.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+    msg_rect = msg.get_rect(center=(surface.get_width() // 2, (surface.get_height() + header_h) // 2))
     surface.blit(msg, msg_rect)
 
 

@@ -14,12 +14,12 @@ from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
 
 
 class Screen(Enum):
-    MENU = auto()      # Main menu: Browse, Scan, About
-    BROWSE = auto()    # Channel list
-    TUNE = auto()      # Tuning in progress
-    PLAY = auto()      # Video playing
-    SCAN = auto()      # Frequency scan (future)
-    ABOUT = auto()     # About screen
+    MENU = auto()  # Main menu: Browse, Scan, About
+    BROWSE = auto()  # Channel list
+    TUNE = auto()  # Tuning in progress
+    PLAY = auto()  # Video playing
+    SCAN = auto()  # Frequency scan (future)
+    ABOUT = auto()  # About screen
 
 
 # Main menu options
@@ -33,7 +33,9 @@ VOLUME_DECREMENT = -5
 class State:
     screen: Screen = Screen.MENU
     menu_index: int = 0       # Main menu selection (0=Browse, 1=Scan, 2=About)
-    browse_index: int = 0     # Channel list selection
+    browse_index: int = 0     # Channel list selection (-1 = Back)
+    about_index: int = 0      # About screen (-1 = Back, 0 = content)
+    scan_index: int = 0       # Scan screen (-1 = Back, 0 = content)
     channels: list[Channel] | None = None
 
     def __post_init__(self):
@@ -128,10 +130,10 @@ class FPTV:
                 self.display.render_browse(self.state.channels, self.state.browse_index)
 
             elif self.state.screen == Screen.ABOUT:
-                self.display.render_about(self._get_about_info())
+                self.display.render_about(self._get_about_info(), self.state.about_index)
 
             elif self.state.screen == Screen.SCAN:
-                self.display.render_scan("Press button to go back")
+                self.display.render_scan("Not implemented yet", self.state.scan_index)
 
         self.shutdown()
 
@@ -150,13 +152,18 @@ class FPTV:
                 self.state.screen = Screen.ABOUT
 
         elif screen == Screen.BROWSE:
-            # Play selected channel
-            ch = self.state.current_channel
-            if ch:
-                self.tuner.resume()
-                self.tuner.tune_now(ch.url, ch.name)
-                self.display.show_channel_name(ch.name, seconds=3.0)
-                self.state.screen = Screen.TUNE
+            if self.state.browse_index == -1:
+                # Back button selected - return to main menu
+                self.state.screen = Screen.MENU
+                self.state.browse_index = 0  # Reset for next time
+            else:
+                # Play selected channel
+                ch = self.state.current_channel
+                if ch:
+                    self.tuner.resume()
+                    self.tuner.tune_now(ch.url, ch.name)
+                    self.display.show_channel_name(ch.name, seconds=3.0)
+                    self.state.screen = Screen.TUNE
 
         elif screen in (Screen.PLAY, Screen.TUNE):
             # Return to browse (at current channel position)
@@ -164,9 +171,17 @@ class FPTV:
             self.tuner.pause()
             self.state.screen = Screen.BROWSE
 
-        elif screen in (Screen.ABOUT, Screen.SCAN):
-            # Return to main menu
-            self.state.screen = Screen.MENU
+        elif screen == Screen.ABOUT:
+            if self.state.about_index == -1:
+                # Back button selected
+                self.state.screen = Screen.MENU
+                self.state.about_index = 0  # Reset for next time
+
+        elif screen == Screen.SCAN:
+            if self.state.scan_index == -1:
+                # Back button selected
+                self.state.screen = Screen.MENU
+                self.state.scan_index = 0  # Reset for next time
 
     def _handle_wheel(self, delta: int) -> None:
         """Handle wheel rotation based on current screen."""
@@ -178,10 +193,13 @@ class FPTV:
             self.state.menu_index = max(0, min(len(MENU_OPTIONS) - 1, i))
 
         elif screen == Screen.BROWSE:
-            # Navigate channel list
+            # Navigate channel list (-1 = Back button)
             if self.state.channels:
                 i = self.state.browse_index + delta
-                self.state.browse_index = max(0, min(len(self.state.channels) - 1, i))
+                self.state.browse_index = max(-1, min(len(self.state.channels) - 1, i))
+            else:
+                # No channels - only Back button is available
+                self.state.browse_index = -1
 
         elif screen in (Screen.PLAY, Screen.TUNE):
             # Change channel (debounced)
@@ -192,6 +210,16 @@ class FPTV:
                 if ch:
                     self.display.show_channel_name(ch.name, seconds=3.0)
                     self.tuner.request_tune(ch.url, ch.name)
+
+        elif screen == Screen.ABOUT:
+            # Scroll up to Back (-1), down to content (0)
+            i = self.state.about_index + delta
+            self.state.about_index = max(-1, min(0, i))
+
+        elif screen == Screen.SCAN:
+            # Scroll up to Back (-1), down to content (0)
+            i = self.state.scan_index + delta
+            self.state.scan_index = max(-1, min(0, i))
 
     def _get_about_info(self) -> dict[str, str]:
         """Get device info for about screen (placeholder)."""
