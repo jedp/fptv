@@ -147,6 +147,8 @@ class TVHeadendScanner:
         self._session = requests.Session()
         if config.user and config.password:
             self._session.auth = HTTPDigestAuth(config.user, config.password)
+        else:
+            self.log.out("WARNING: No TVH auth configured (set TVH_USER and TVH_PASS)")
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response | None:
         """
@@ -1157,26 +1159,32 @@ class TVHeadendScanner:
         Fetch currently-airing programs from the EPG.
 
         Returns:
-            Dict mapping channel_uuid -> EPGEvent for channels with current programming.
-            Channels without EPG data are not included in the result.
+            Dict mapping channel_name -> EPGEvent for channels with current programming.
+            Keyed by channel name (not UUID) because tvg-id in playlist doesn't match
+            channelUuid in EPG data.
         """
         now = int(time.time())
 
         try:
             # Fetch EPG events - TVH returns all events, we filter for "now"
+            # Note: "start" here is pagination offset, not time filter
             data = self._get_json("/api/epg/events/grid", params={
                 "start": 0,
-                "limit": 1000,  # Reasonable upper bound
+                "limit": 2000,  # Reasonable upper bound
             })
         except Exception as e:
-            self.log.err(f"get_epg_now: {e}")
+            self.log.err(f"get_epg_now failed: {e}")
             return {}
+
+        entries = data.get("entries", [])
 
         result: dict[str, EPGEvent] = {}
 
-        for entry in data.get("entries", []):
+        for entry in entries:
+            # Key by channel name since tvg-id != channelUuid in TVHeadend
+            channel_name = entry.get("channelName") or ""
             channel_uuid = entry.get("channelUuid") or ""
-            if not channel_uuid:
+            if not channel_name:
                 continue
 
             start = int(entry.get("start", 0))
@@ -1187,9 +1195,9 @@ class TVHeadendScanner:
             if start <= now < stop and title:
                 # Only keep one event per channel (the current one)
                 # If multiple match, prefer the one that started most recently
-                existing = result.get(channel_uuid)
+                existing = result.get(channel_name)
                 if existing is None or start > existing.start:
-                    result[channel_uuid] = EPGEvent(
+                    result[channel_name] = EPGEvent(
                         channel_uuid=channel_uuid,
                         title=title,
                         start=start,
