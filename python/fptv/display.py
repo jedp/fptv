@@ -30,11 +30,12 @@ class Display:
     - Flip/swap coordination
 
     Usage:
-        display = Display(tuner)
-        display.initialize()
+        display = Display()
+        tuner = Tuner(tvh)  # needs GL context from display
+        display.set_tuner(tuner)
 
         # In mainloop:
-        display.render_video(tuner_status, force_flip=False)
+        display.render_video(force_flip=False)
         # or
         display.render_menu()
 
@@ -43,27 +44,14 @@ class Display:
         display.show_volume(75)
     """
 
-    def __init__(self, tuner: Tuner):
-        self._tuner = tuner
+    def __init__(self, fullscreen: bool = True):
+        self._tuner: Tuner | None = None
         self._log = Logger("display")
 
-        self.w = 0
-        self.h = 0
+        self._initialize(fullscreen)
 
-        # Initialized in initialize()
-        self._font_title: pygame.font.Font | None = None
-        self._font_item: pygame.font.Font | None = None
-        self._font_small: pygame.font.Font | None = None
-        self._renderer: GLMenuRenderer | None = None
-        self._overlays: OverlayManager | None = None
-        self._menu_surface: pygame.Surface | None = None
-
-    def initialize(self, fullscreen: bool = True) -> None:
-        """
-        Initialize pygame display, fonts, and renderers.
-
-        Must be called before any rendering.
-        """
+    def _initialize(self, fullscreen: bool) -> None:
+        """Initialize pygame display, fonts, and renderers."""
         pygame.init()
         pygame.font.init()
 
@@ -97,6 +85,10 @@ class Display:
         self._menu_surface = pygame.Surface((self.w, self.h))
 
         self._log.out("Display initialized")
+
+    def set_tuner(self, tuner: Tuner) -> None:
+        """Set the tuner reference. Must be called before render_video()."""
+        self._tuner = tuner
 
     # -------------------------------------------------------------------------
     # Rendering

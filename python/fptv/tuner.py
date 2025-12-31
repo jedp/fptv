@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
-from fptv.tvh import WatchdogWorker
+from fptv.tvh import WatchdogWorker, TVHeadendScanner
 
 if TYPE_CHECKING:
     pass
@@ -41,26 +41,26 @@ class TunerStatus:
 class Tuner:
     """
     High-level video tuning controller.
-    
+
     Owns and hides:
     - EmbeddedMPV (video player)
     - WatchdogWorker (stream health monitoring)
-    
+
     Handles:
     - mpv lifecycle (initialize, render, shutdown)
     - Input debouncing (coalesces rapid channel changes)
     - Tune timeout and retry logic
     - State machine (IDLE → TUNING → PLAYING or FAILED)
     - Automatic stream recovery via watchdog
-    
+
     Usage:
-        tuner = Tuner(tvh)
-        tuner.initialize()
-        
+        display = Display()  # creates GL context
+        tuner = Tuner(tvh)   # needs GL context
+
         # Enter video mode
         tuner.resume()
         tuner.tune_now(url, "Channel: PBS")
-        
+
         # In render loop:
         did_render = tuner.render_frame(width, height)
         status = tuner.tick(did_render)
@@ -74,11 +74,12 @@ class Tuner:
 
     def __init__(
             self,
-            tvh: "TVHeadendScanner | None" = None,
+            tvh: TVHeadendScanner | None = None,
             debounce_s: float = 0.150,
             tune_timeout_s: float = 20.0,
             max_retries: int = 2,
             frame_grace_s: float = 0.2,  # ignore early frames (buffered)
+            test_source: str | None = "av://lavfi:mandelbrot",
     ):
         self._tvh = tvh
         self._mpv: EmbeddedMPV | None = None
@@ -105,6 +106,8 @@ class Tuner:
         self._tune_started_at: float = 0.0
         self._tune_attempts: int = 0
         self._status_message: str | None = None
+
+        self._initialize(test_source)
 
     # -------------------------------------------------------------------------
     # Properties
@@ -135,13 +138,8 @@ class Tuner:
     # Lifecycle (wraps mpv)
     # -------------------------------------------------------------------------
 
-    def initialize(self, test_source: str | None = "av://lavfi:mandelbrot") -> None:
-        """
-        Initialize the video player and watchdog.
-
-        Call after pygame display is created (needs GL context).
-        Optionally loads a test source and pauses.
-        """
+    def _initialize(self, test_source: str | None) -> None:
+        """Initialize the video player and watchdog."""
         if self._mpv is None:
             self._mpv = EmbeddedMPV()
         self._mpv.initialize()
@@ -301,10 +299,10 @@ class Tuner:
     def _tick_state(self, did_render_frame: bool) -> TunerStatus:
         """
         Internal: tick the tune state machine.
-        
+
         Args:
             did_render_frame: True if mpv rendered a new frame this tick
-            
+
         Returns:
             TuneStatus with current state and any message for overlay display
         """
