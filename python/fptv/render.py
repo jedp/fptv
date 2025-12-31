@@ -582,7 +582,8 @@ def draw_browse(
         item_font: pygame.font.Font,
         channels: list,  # List[Channel]
         selected: int,  # -1 = Back selected, 0+ = channel index
-        epg_map: dict = None,  # Optional: {channel_uuid: EPGEvent}
+        epg_map: dict = None,  # Optional: {channel_name: EPGEvent}
+        epg_font: pygame.font.Font = None,  # Smaller font for EPG titles
 ) -> None:
     """Draw the channel browser with scrolling list. selected=-1 means Back."""
     surface.fill(BG_NORM)
@@ -645,18 +646,27 @@ def draw_browse(
             epg_event = epg_map.get(channel.name)
             if epg_event and epg_event.title:
                 title = epg_event.title
+                font = epg_font or item_font
+
+                # Start EPG at default position, or after channel name if it's longer
+                epg_start_x = max(epg_x, text_rect.right + 20)
+                available_width = w - epg_start_x - pad_x
+
+                # Skip if no room for EPG text
+                if available_width < 50:
+                    continue
 
                 # Truncate if too long
-                epg_surf = item_font.render(title, True, epg_fg)
-                if epg_surf.get_width() > epg_max_width:
+                epg_surf = font.render(title, True, epg_fg)
+                if epg_surf.get_width() > available_width:
                     # Truncate with ellipsis
-                    while title and epg_surf.get_width() > epg_max_width:
+                    while title and epg_surf.get_width() > available_width:
                         title = title[:-1]
-                        epg_surf = item_font.render(title + "...", True, epg_fg)
+                        epg_surf = font.render(title + "...", True, epg_fg)
                     title = title + "..." if title else ""
-                    epg_surf = item_font.render(title, True, epg_fg)
+                    epg_surf = font.render(title, True, epg_fg)
 
-                epg_rect = epg_surf.get_rect(midleft=(epg_x, item_y + line_h // 2))
+                epg_rect = epg_surf.get_rect(midleft=(epg_start_x, item_y + line_h // 2))
                 surface.blit(epg_surf, epg_rect)
 
 

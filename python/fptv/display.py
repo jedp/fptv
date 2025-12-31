@@ -142,7 +142,7 @@ class Display:
         """Render channel browser screen with optional EPG (now playing) info."""
         init_viewport(self.w, self.h)
 
-        draw_browse(self._menu_surface, self._font_item, channels, selected, epg_map)
+        draw_browse(self._menu_surface, self._font_item, channels, selected, epg_map, self._font_small)
         self._renderer.update_from_surface(self._menu_surface)
 
         clear_screen()
