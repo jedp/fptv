@@ -23,8 +23,10 @@ class Screen(Enum):
     SHUTDOWN = auto()
     MAINTENANCE = auto()
 
+
 VOLUME_INCREMENT = 5
 VOLUME_DECREMENT = -5
+
 
 @dataclass
 class State:
@@ -49,22 +51,17 @@ class FPTV:
         self.input = InputMapper(self._event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
 
-        # Tuner (owns mpv + watchdog)
-        self.tuner = Tuner(self.tvh)
-        
         # Display (owns pygame, fonts, overlays, menu renderer)
-        self.display = Display(self.tuner)
-        self.display.initialize()
-        
-        # Initialize tuner after display (needs GL context)
-        self.tuner.initialize()
+        self.display = Display()
+
+        # Tuner (owns mpv + watchdog) - must construct after Display for GL context
+        self.tuner = Tuner(self.tvh)
+        self.display.set_tuner(self.tuner)
 
     def mainloop(self) -> None:
         self.log.out(f"Loaded {len(self.state.channels)} channels")
 
-        mode: Screen = Screen.MENU
         force_flip = False
-
         running = True
         clock = pygame.time.Clock()
 
@@ -77,20 +74,20 @@ class FPTV:
                     running = False
 
                 elif action == Action.TOGGLE_MODE:
-                    if mode == Screen.MENU:
+                    if self.state.screen == Screen.MENU:
                         # Start video mode
                         self.tuner.resume()
                         if self.state.channels:
                             ch = self.state.channels[self.state.browse_index]
                             self.tuner.tune_now(ch.url, f"Channel: {ch.name}")
                             self.display.show_channel_name(f"Channel: {ch.name}", seconds=3.0)
-                            mode = Screen.TUNE
+                            self.state.screen = Screen.TUNE
                         else:
-                            mode = Screen.PLAY
+                            self.state.screen = Screen.PLAY
                         force_flip = True
                     else:
                         # Return to menu
-                        mode = Screen.MENU
+                        self.state.screen = Screen.MENU
                         self.tuner.cancel()
                         self.tuner.pause()
                         force_flip = True
@@ -108,7 +105,7 @@ class FPTV:
                     force_flip = True
 
                     # If in video mode, request debounced tune
-                    if mode in (Screen.PLAY, Screen.TUNE):
+                    if self.state.screen in (Screen.PLAY, Screen.TUNE):
                         self.tuner.request_tune(channel.url, f"Channel: {channel.name}")
 
                 elif action == Action.VOLUME_UP:
@@ -118,7 +115,7 @@ class FPTV:
                     self.tuner.add_volume(VOLUME_DECREMENT)
 
             # --- Render ---
-            if mode in (Screen.PLAY, Screen.TUNE):
+            if self.state.screen in (Screen.PLAY, Screen.TUNE):
                 # Render video + overlays
                 did_flip, did_render = self.display.render_video(force_flip)
                 if did_flip:
@@ -127,15 +124,15 @@ class FPTV:
                 # Tick tuner state machine (after render so we know if frame rendered)
                 tune_status = self.tuner.tick(did_render)
 
-                # Update mode based on tuner state
+                # Update screen based on tuner state
                 if tune_status.state == TunerState.PLAYING:
-                    mode = Screen.PLAY
+                    self.state.screen = Screen.PLAY
                 elif tune_status.state == TunerState.TUNING:
-                    mode = Screen.TUNE
+                    self.state.screen = Screen.TUNE
                 elif tune_status.state == TunerState.FAILED:
                     self.display.show_channel_name("No signal", seconds=3.0)
                     self.tuner.pause()
-                    mode = Screen.MENU
+                    self.state.screen = Screen.MENU
                     force_flip = True
 
                 # Show status messages (Retrying…, etc.)
@@ -154,9 +151,7 @@ class FPTV:
         try:
             print("Releasing GPIOs.")
             self.hw.close()
-            print("Shutting down tuner.")
-            self.tuner.shutdown()
-            print("Shutting down display.")
+            print("Shutting down display (and tuner).")
             self.display.shutdown()
         except Exception as e:
             print(f"Error during shutdown: {e}")
