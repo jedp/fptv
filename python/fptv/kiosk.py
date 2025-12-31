@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue
@@ -7,19 +6,12 @@ from typing import List
 
 import pygame
 
+from fptv.display import Display
 from fptv.hw import HwEventBinding
 from fptv.input import Action, InputMapper
 from fptv.log import Logger
-from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
-from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
 from fptv.tuner import Tuner, TunerState
 from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
-
-FPTV_CAPTION = "fptv"
-ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
-
-SCREEN_H = 480
-SCREEN_W = 800
 
 
 class Screen(Enum):
@@ -31,6 +23,8 @@ class Screen(Enum):
     SHUTDOWN = auto()
     MAINTENANCE = auto()
 
+VOLUME_INCREMENT = 5
+VOLUME_DECREMENT = -5
 
 @dataclass
 class State:
@@ -47,9 +41,7 @@ class State:
 
 
 class FPTV:
-    def __init__(self, screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
-        self.w = screen_w
-        self.h = screen_h
+    def __init__(self):
         self.log = Logger("fptv")
         self._event_queue = SimpleQueue()
         self.tvh = TVHeadendScanner(ScanConfig.from_env())
@@ -57,46 +49,20 @@ class FPTV:
         self.input = InputMapper(self._event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
 
-        pygame.init()
-        pygame.font.init()
-
-        self._init_renderer()
+        # Tuner (owns mpv + watchdog)
         self.tuner = Tuner(self.tvh)
+        
+        # Display (owns pygame, fonts, overlays, menu renderer)
+        self.display = Display(self.tuner)
+        self.display.initialize()
+        
+        # Initialize tuner after display (needs GL context)
         self.tuner.initialize()
 
-        self.renderer = GLMenuRenderer(self.w, self.h)
-
-    def _init_renderer(self):
-        pygame.display.set_mode((0, 0), pygame.OPENGL | pygame.DOUBLEBUF | pygame.FULLSCREEN)
-        pygame.mouse.set_visible(False)
-
-        w, h = pygame.display.get_surface().get_size()
-        self.log.out(f"SDL driver: {pygame.display.get_driver()} size={w}x{h}")
-
-        self.font_title = pygame.font.Font(f"{ASSETS_FONT}/VeraSeBd.ttf", 92)
-        self.font_item = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 56)
-        self.font_small = pygame.font.Font(f"{ASSETS_FONT}/VeraSe.ttf", 32)
-
-        self.renderer = GLMenuRenderer(w, h)
-        self.overlays = OverlayManager(
-            screen_w=w, screen_h=h,
-            font=self.font_item,
-            make_text=make_text_overlay,
-            make_volume=make_volume_overlay,
-        )
-        self.log.out("Renderer initialized")
-
     def mainloop(self) -> None:
-        pygame.init()
-        pygame.display.set_mode((self.w, self.h), pygame.FULLSCREEN | pygame.OPENGL | pygame.DOUBLEBUF)
-
-        menu_surf = pygame.Surface((SCREEN_W, SCREEN_H))
-
-        # Channel list
         self.log.out(f"Loaded {len(self.state.channels)} channels")
 
         mode: Screen = Screen.MENU
-        self.overlays.set_channel_name("Channel: None")
         force_flip = False
 
         running = True
@@ -117,7 +83,7 @@ class FPTV:
                         if self.state.channels:
                             ch = self.state.channels[self.state.browse_index]
                             self.tuner.tune_now(ch.url, f"Channel: {ch.name}")
-                            self.overlays.set_channel_name(f"Channel: {ch.name}", seconds=3.0)
+                            self.display.show_channel_name(f"Channel: {ch.name}", seconds=3.0)
                             mode = Screen.TUNE
                         else:
                             mode = Screen.PLAY
@@ -138,7 +104,7 @@ class FPTV:
                     i = max(0, min(len(self.state.channels) - 1, i))
                     self.state.browse_index = i
                     channel = self.state.channels[self.state.browse_index]
-                    self.overlays.set_channel_name(f"Channel: {channel.name}", seconds=3.0)
+                    self.display.show_channel_name(f"Channel: {channel.name}", seconds=3.0)
                     force_flip = True
 
                     # If in video mode, request debounced tune
@@ -146,19 +112,19 @@ class FPTV:
                         self.tuner.request_tune(channel.url, f"Channel: {channel.name}")
 
                 elif action == Action.VOLUME_UP:
-                    self.tuner.add_volume(5)
+                    self.tuner.add_volume(VOLUME_INCREMENT)
 
                 elif action == Action.VOLUME_DOWN:
-                    self.tuner.add_volume(-5)
+                    self.tuner.add_volume(VOLUME_DECREMENT)
 
             # --- Render ---
-            init_viewport(self.w, self.h)
-
             if mode in (Screen.PLAY, Screen.TUNE):
-                clear_screen()
+                # Render video + overlays
+                did_flip, did_render = self.display.render_video(force_flip)
+                if did_flip:
+                    force_flip = False
 
-                # Render video frame, then tick tuner state machine
-                did_render = self.tuner.render_frame(self.w, self.h)
+                # Tick tuner state machine (after render so we know if frame rendered)
                 tune_status = self.tuner.tick(did_render)
 
                 # Update mode based on tuner state
@@ -167,7 +133,7 @@ class FPTV:
                 elif tune_status.state == TunerState.TUNING:
                     mode = Screen.TUNE
                 elif tune_status.state == TunerState.FAILED:
-                    self.overlays.set_channel_name("No signal", seconds=3.0)
+                    self.display.show_channel_name("No signal", seconds=3.0)
                     self.tuner.pause()
                     mode = Screen.MENU
                     force_flip = True
@@ -175,28 +141,12 @@ class FPTV:
                 # Show status messages (Retrying…, etc.)
                 if tune_status.message:
                     seconds = 5.0 if tune_status.message == "Retrying…" else 3.0
-                    self.overlays.set_channel_name(tune_status.message, seconds=seconds)
+                    self.display.show_channel_name(tune_status.message, seconds=seconds)
                     force_flip = True
-
-                # Overlays
-                self.overlays.tick()
-                self.overlays.draw()
-
-                # Present
-                if did_render or force_flip:
-                    pygame.display.flip()
-                    self.tuner.report_swap()
-                    force_flip = False
 
             else:
                 # MENU: draw menu and present
-                draw_menu_surface(menu_surf, self.font_item, "Press button to toggle video")
-                self.renderer.update_from_surface(menu_surf)
-
-                clear_screen()
-                self.renderer.draw_fullscreen()
-                pygame.display.flip()
-                self.tuner.report_swap()
+                self.display.render_menu()
 
         self.shutdown()
 
@@ -206,8 +156,8 @@ class FPTV:
             self.hw.close()
             print("Shutting down tuner.")
             self.tuner.shutdown()
-            print("Quitting pygame engine.")
-            pygame.quit()
+            print("Shutting down display.")
+            self.display.shutdown()
         except Exception as e:
             print(f"Error during shutdown: {e}")
             return -1
