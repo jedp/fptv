@@ -562,12 +562,19 @@ def draw_browse(
     header_h = 70
     line_h = 52
     visible = max(1, (h - header_h) // line_h)
-    half = visible // 2
+    total = len(channels)
 
-    # Center selection in visible window
-    start = max(0, selected - half)
-    end = min(len(channels), start + visible)
-    start = max(0, end - visible)
+    # Simple scroll: selection can move freely in visible area,
+    # window scrolls only when selection would go off-screen
+    if total <= visible:
+        start = 0
+    else:
+        # Scroll when selection reaches bottom of visible area
+        start = max(0, selected - visible + 1)
+        # Don't scroll past the end
+        start = min(start, total - visible)
+    
+    end = min(start + visible, total)
 
     y0 = header_h
     for row, idx in enumerate(range(start, end)):
