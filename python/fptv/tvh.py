@@ -1756,27 +1756,48 @@ class TVHeadendScanner:
 
         return True
 
+
+@dataclass
+class WatchdogState:
+    """Explicit state shared between main thread and watchdog thread."""
+    expecting: bool = False
+    current_url: str | None = None
+    tuning_started_at: float = 0.0
+
+
 class WatchdogWorker:
     def __init__(self, tvh, *, ua_tag: str, interval_s: float = 1.0):
+        self._log = Logger("watchdog")
         self.tvh = tvh
         self.ua_tag = ua_tag
         self.interval_s = interval_s
-        self.actions = SimpleQueue()   # ("reload", url, reason)
+        self.actions = SimpleQueue()  # ("reload", url, reason)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="tvh-watchdog", daemon=True)
 
-        self._bad_since = None
+        self._bad_since: float | None = None
         self._last_fix = 0.0
 
-        # optional: reuse a Session inside tvh (see note below)
-        # self.tvh.set_session(...)
+        # Explicit state updated by main thread via update_state()
+        self._state = WatchdogState()
 
     def start(self):
+        self._log.out("Watchdog started")
         self._thread.start()
 
     def shutdown(self):
         self._stop.set()
         self._thread.join(timeout=2.0)
+        self._log.out("Watchdog stopped")
+
+    def update_state(
+            self,
+            expecting: bool,
+            current_url: str | None,
+            tuning_started_at: float,
+    ) -> None:
+        """Update the shared state from the main thread."""
+        self._state = WatchdogState(expecting, current_url, tuning_started_at)
 
     def _find_our_sub(self, subs: dict):
         for e in subs.get("entries", []):
@@ -1793,15 +1814,17 @@ class WatchdogWorker:
             try:
                 subs = self.tvh.subscriptions()
             except Exception:
-                time.sleep(self.interval_s)
+                if self._stop.wait(self.interval_s):
+                    break  # Stop requested during wait
                 continue
 
             ours = self._find_our_sub(subs)
 
-            # You’ll set these from the main thread via shared vars / atomic snapshot:
-            expecting = getattr(self, "expecting", False)
-            current_url = getattr(self, "current_url", None)
-            tuning_started_at = getattr(self, "tuning_started_at", 0.0)
+            # Read explicit state (set by main thread via update_state())
+            ws = self._state
+            expecting = ws.expecting
+            current_url = ws.current_url
+            tuning_started_at = ws.tuning_started_at
 
             # grace: immediately after tune, missing subscription can be normal
             if expecting and (now - tuning_started_at) < 1.0:
@@ -1813,9 +1836,11 @@ class WatchdogWorker:
                 if not ours:
                     if self._bad_since is None:
                         self._bad_since = now
+                        self._log.out("Issue detected: subscription missing")
                     elif now - self._bad_since > 3.0 and now - self._last_fix > 1.0:
                         self._last_fix = now
                         self._bad_since = now
+                        self._log.out("Triggering reload: missing_subscription")
                         self.actions.put(("reload", current_url, "missing_subscription"))
                         took_action = True
                 else:
@@ -1833,17 +1858,23 @@ class WatchdogWorker:
                     )
 
                     if not looks_stuck:
+                        if self._bad_since is not None:
+                            self._log.out("Stream health restored")
                         self._bad_since = None
                     else:
                         if self._bad_since is None:
                             self._bad_since = now
+                            self._log.out(f"Issue detected: {state=} {errs=} in={rate_in} out={rate_out}")
                         elif now - self._bad_since > 2.0 and now - self._last_fix > 1.0:
                             self._last_fix = now
                             self._bad_since = now
-                            self.actions.put(("reload", current_url, f"stuck:{state}:{errs}:{rate_in}/{rate_out}"))
+                            reason = f"stuck:{state}:{errs}:{rate_in}/{rate_out}"
+                            self._log.out(f"Triggering reload: {reason}")
+                            self.actions.put(("reload", current_url, reason))
                             took_action = True
 
-            time.sleep(self.interval_s if not took_action else 0.1)
+            self._stop.wait(self.interval_s if not took_action else 0.1)
+
 
 def main():
     """Command-line interface for the scanner."""

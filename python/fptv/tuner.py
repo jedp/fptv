@@ -282,9 +282,11 @@ class Tuner:
             return
 
         # Update watchdog with current state
-        self._watchdog.expecting = self.is_expecting_video
-        self._watchdog.current_url = self._current_url
-        self._watchdog.tuning_started_at = self._tune_started_at
+        self._watchdog.update_state(
+            expecting=self.is_expecting_video,
+            current_url=self._current_url,
+            tuning_started_at=self._tune_started_at,
+        )
 
         # Drain and process watchdog actions
         while True:
