@@ -138,11 +138,11 @@ class Display:
         pygame.display.flip()
         self._tuner.report_swap()
 
-    def render_browse(self, channels: list, selected: int) -> None:
-        """Render channel browser screen."""
+    def render_browse(self, channels: list, selected: int, epg_map: dict = None) -> None:
+        """Render channel browser screen with optional EPG (now playing) info."""
         init_viewport(self.w, self.h)
 
-        draw_browse(self._menu_surface, self._font_item, channels, selected)
+        draw_browse(self._menu_surface, self._font_item, channels, selected, epg_map)
         self._renderer.update_from_surface(self._menu_surface)
 
         clear_screen()
@@ -154,7 +154,7 @@ class Display:
         """Render about screen with device info. selected=-1 means Back."""
         init_viewport(self.w, self.h)
 
-        draw_about(self._menu_surface, self._font_title, self._font_item, info, 
+        draw_about(self._menu_surface, self._font_title, self._font_item, info,
                    back_selected=(selected == -1))
         self._renderer.update_from_surface(self._menu_surface)
 
