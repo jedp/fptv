@@ -259,6 +259,43 @@ Then return to Muxes
 $ curl -s --digest -u 'jed:i like pie' 'http://localhost:9981/api/mpegts/network/grid' | jq '.entries[0].networkname'
 "ATSC OTA"
 
+## Logging and persistent logs
+
+By default, journald logs to `/run/log/journal`, which is an in-memory filesystem.
+We want to persist logs across reboots.
+
+```commandline
+MACHINE_ID=`cat /etc/machine-id`
+
+sudo mkdir -p /var/log/journal/$MACHINE_ID
+
+sudo chmod 2775 /var/log/journal
+sudo chmod 2755 /var/log/journal/$MACHINE_ID
+
+
+sudo setfacl -R -nm g:adm:rx,d:g:adm:rx /var/log/journal/
+
+sudo systemctl restart systemd-journald
+
+# There's probably a raspberri pi override that makes storage volatile.
+# So create override that takes precedence.
+sudo mkdir -p /etc/systemd/journald.conf.d/
+echo -e "[Journal]\nStorage=persistent" | sudo tee /etc/systemd/journald.conf.d/50-persistent.conf
+
+# Verify it wins
+systemd-analyze cat-config systemd/journald.conf | grep Storage
+
+# Restart journald
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
+
+# Check if it's using persistent now
+journalctl --header | head -3
+```
+
+
+
+
 journald.conf
 
 ```commandline
