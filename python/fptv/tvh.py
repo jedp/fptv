@@ -1551,48 +1551,47 @@ class TVHeadendScanner:
 
         return stats
 
-    def scan(self, progress_callback: Optional[Callable[[str, MuxStates], None]] = None) -> bool:
-        """
-        Perform a full ATSC OTA scan.
+    # -------------------------------------------------------------------------
+    # Scan helper methods - break up the large scan() method into logical steps
+    # -------------------------------------------------------------------------
 
-        Args:
-            progress_callback: Optional callback function(message: str, states: MuxStates)
-                              called periodically with progress updates.
-
-        Returns:
-            True if scan completed successfully, False otherwise.
-        """
-
-        # Log helper to log progress as well.
-        def log(msg: str, states: Optional[MuxStates] = None):
-            if progress_callback:
-                progress_callback(msg, states or MuxStates())
-            else:
-                self.log.out(msg)
-
-        self.set_epg_grabbers_enabled(enabled=False)
-
-        # Step 1: Find network
+    def _scan_ensure_network_ready(
+        self,
+        log: Callable[[str], None],
+    ) -> str | None:
+        """Step 1: Find network and ensure frontends are configured."""
         log(f"Finding network UUID for: {self.config.net_name}")
         net_uuid = self.get_network_uuid()
         if not net_uuid:
             log(f"Network not found: {self.config.net_name}")
-            return False
+            return None
         log(f"Network UUID: {net_uuid}")
 
         log("Ensuring ATSC-T frontends are enabled and linked to network...")
         stats = self.ensure_atsc_t_frontends_enabled_and_linked(net_uuid)
         log(f"Frontend config: {stats}")
+        return net_uuid
 
-        # Step 2: Optionally wipe existing muxes
-        if self.config.wipe_existing_muxes:
-            log("Wiping existing muxes for network...")
-            muxes = self.list_muxes_for_network(net_uuid)
-            for mux_uuid in muxes:
-                self.delete_mux_uuid(mux_uuid)
-            log(f"Deleted {len(muxes)} muxes.")
+    def _scan_wipe_existing_muxes(
+        self,
+        net_uuid: str,
+        log: Callable[[str], None],
+    ) -> None:
+        """Step 2: Wipe existing muxes if configured."""
+        if not self.config.wipe_existing_muxes:
+            return
+        log("Wiping existing muxes for network...")
+        muxes = self.list_muxes_for_network(net_uuid)
+        for mux_uuid in muxes:
+            self.delete_mux_uuid(mux_uuid)
+        log(f"Deleted {len(muxes)} muxes.")
 
-        # Step 3: Create muxes
+    def _scan_create_muxes(
+        self,
+        net_uuid: str,
+        log: Callable[[str], None],
+    ) -> int:
+        """Step 3: Create ATSC muxes for RF channel range."""
         log(f"Creating ATSC muxes RF {self.config.rf_start}..{self.config.rf_end} (modulation={self.config.modulation})...")
         created_count = 0
         for rf in range(self.config.rf_start, self.config.rf_end + 1):
@@ -1604,29 +1603,43 @@ class TVHeadendScanner:
             except ValueError:
                 continue
         log(f"Should have created {created_count} muxes.")
+
+        # Debug: verify mux count
         response = self._get("/api/mpegts/mux/grid?limit=99999")
         if response.status_code != 200:
             self.log.err(f"Failed to fetch mux grid: {response.status_code}: {response.text}")
         else:
             muxes = response.json().get('entries', [])
             self.log.out(f"There are now {len(muxes)} muxes in the network: {muxes}")
+        return created_count
 
-        # Step 4: Force scan all muxes
+    def _scan_force_scan_muxes(
+        self,
+        net_uuid: str,
+        log: Callable[[str], None],
+    ) -> None:
+        """Step 4: Force scan on all muxes in network."""
         log("Forcing scan on all muxes in network...")
         muxes = self.list_muxes_for_network(net_uuid)
         for mux_uuid in muxes:
             self.force_scan_mux(mux_uuid)
         log(f"Requested scan for {len(muxes)} muxes.")
 
-        # Step 5: Poll until settled
-        log(f"Polling scan progress (timeout {self.config.timeout_secs}s)...")
+    def _scan_wait_for_completion(
+        self,
+        net_uuid: str,
+        log: Callable[[str, MuxStates | None], None],
+    ) -> bool:
+        """Step 5: Poll until scan settles or times out. Returns True if settled."""
+        log(f"Polling scan progress (timeout {self.config.timeout_secs}s)...", None)
         start_time = time.time()
         states = self.count_mux_states(net_uuid)
-        log(f"Waiting for scan to settle. {states}.")
+        log(f"Waiting for scan to settle. {states}.", None)
+
         while True:
             elapsed = time.time() - start_time
             if elapsed > self.config.timeout_secs:
-                log("Timed out waiting for scan to settle.")
+                log("Timed out waiting for scan to settle.", None)
                 states = self.count_mux_states(net_uuid)
                 log(str(states), states)
                 return False
@@ -1638,46 +1651,42 @@ class TVHeadendScanner:
                 self.log.out("Scan settled.")
                 break
 
-            log(f"Waiting for scan to settle. {elapsed:.1f}s elapsed. {states}.")
+            log(f"Waiting for scan to settle. {elapsed:.1f}s elapsed. {states}.", None)
             time.sleep(self.config.sleep_secs)
 
-        log("Sleeping to let tvheadend settle...")
+        log("Sleeping to let tvheadend settle...", None)
         time.sleep(SETTLE_AFTER_SCAN_SECS)
+        return True
 
-        # Step 6: Start service mapping
-        # In order:
-        # - Delete orphan channels (no services attached)
-        # - Map services → channels
-        # - Delete unnamed / junk channels
-        # - Deduplicate channels
-        # - (Optional) renumber / sort
-
-        # After wiping muxes or rescanning, TVH leaves behind channels with: "services": [].
-        # These cannot stream or get services again, and they will confuse de-duplication.
+    def _scan_cleanup_channels(
+        self,
+        net_uuid: str,
+        log: Callable[[str], None],
+    ) -> None:
+        """Step 6: Clean up channels - delete orphans, map services, deduplicate."""
+        # Delete orphan channels (no services attached)
         log("Deleting orphan channels...")
         deleted = self.delete_orphan_channels()
         log(f"Deleted {deleted} orphan channels.")
 
+        # Disable failed muxes
         log("Disabling failed muxes")
         self.disable_failed_muxes(net_uuid)
         log("Sleeping to let service graph settle...")
         time.sleep(SETTLE_AFTER_DISABLE_SECS)
 
-        # At this point, services are authoritative, channel names come from svcname,
-        # and channels have valid services. So we can now map services to channels.
+        # Map services to channels
         log("Mapping services -> channels (deterministic)...")
         created, skipped_mapped, skipped_no_name = self.ensure_channels_mapped_from_services()
         log(f"Mapping results: created={created}, already_mapped={skipped_mapped}, no_name={skipped_no_name}")
 
-        # Some channels have names like '{name-not-set}' or ''. They're partially broken objects
-        # or maybe garbage from previous scans. They're useless, so delete them now that we've
-        # completed the service mapping.
+        # Delete unnamed/junk channels
         if self.config.delete_unnamed_channels:
             log("Cleaning up unnamed channels...")
             deleted = self.cleanup_unnamed_channels()
             log(f"Deleted {deleted} unnamed channels.")
 
-        # Deduplicate channels by name, preferring the one with the lowest major number.
+        # Deduplicate channels by name
         log("Deduplicating channels...")
         dedup_stats = self.deduplicate_channels_by_name(net_uuid)
         log(f"Dedup stats: {dedup_stats}")
@@ -1685,6 +1694,7 @@ class TVHeadendScanner:
         log("Sleeping to let tuners and table decoding settle...")
         time.sleep(SETTLE_AFTER_MAPPING_SECS)
 
+        # Health check and final prune
         log("Debug: Health check ...")
         self.debug_channel_service_mux_health(net_uuid)
 
@@ -1694,8 +1704,48 @@ class TVHeadendScanner:
         log("Sleeping to reduce flakiness due to immediate retuning after write...")
         time.sleep(SETTLE_AFTER_PRUNE_SECS)
 
-        log("Done with scan.")
+    def scan(self, progress_callback: Optional[Callable[[str, MuxStates], None]] = None) -> bool:
+        """
+        Perform a full ATSC OTA scan.
 
+        Args:
+            progress_callback: Optional callback function(message: str, states: MuxStates)
+                              called periodically with progress updates.
+
+        Returns:
+            True if scan completed successfully, False otherwise.
+        """
+        # Log helper that routes to callback or self.log
+        def log(msg: str, states: Optional[MuxStates] = None):
+            if progress_callback:
+                progress_callback(msg, states or MuxStates())
+            else:
+                self.log.out(msg)
+
+        self.set_epg_grabbers_enabled(enabled=False)
+
+        # Step 1: Find network and configure frontends
+        net_uuid = self._scan_ensure_network_ready(log)
+        if not net_uuid:
+            return False
+
+        # Step 2: Optionally wipe existing muxes
+        self._scan_wipe_existing_muxes(net_uuid, log)
+
+        # Step 3: Create muxes for RF channel range
+        self._scan_create_muxes(net_uuid, log)
+
+        # Step 4: Force scan all muxes
+        self._scan_force_scan_muxes(net_uuid, log)
+
+        # Step 5: Wait for scan to complete
+        if not self._scan_wait_for_completion(net_uuid, log):
+            return False
+
+        # Step 6: Clean up channels (orphans, mapping, dedup, prune)
+        self._scan_cleanup_channels(net_uuid, log)
+
+        log("Done with scan.")
         return True
 
 
