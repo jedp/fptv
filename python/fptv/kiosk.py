@@ -13,23 +13,16 @@ from fptv.event import Event
 from fptv.hw import HwEventBinding, ENCODER_CHANNEL_NAME, ENCODER_VOLUME_NAME
 from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
+from fptv.tuner import Tuner, TunerState
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
 from fptv.tvh import Channel, TVHeadendScanner, ScanConfig, WatchdogWorker
-
-MPV_FORMAT_FLAG = 3
 
 FPTV_CAPTION = "fptv"
 ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
 
 SCREEN_H = 480
 SCREEN_W = 800
-
-DEBOUNCE_S = 0.150  # a feel-good number
-MIN_TUNE_INTERVAL_S = 0.35  # prevents hammering tvheadend/mpv
-WATCHDOG_EVERY_S = 3.0
-TUNE_TIMEOUT_S = 20.0
-MAX_TUNE_RETRIES = 2
 
 
 class Screen(Enum):
@@ -132,6 +125,7 @@ class FPTV:
         self._init_renderer()  # creates GL context + renderer + overlays
         self.mpv = EmbeddedMPV()
         self.mpv.initialize()  # now GL proc lookup is valid
+        self.tuner = Tuner(self.mpv)
 
         self.renderer = GLMenuRenderer(self.w, self.h)
 
@@ -172,16 +166,7 @@ class FPTV:
 
         mode: Screen = Screen.MENU
         self.overlays.set_channel_name("Channel: None")
-
-        pending_url: str | None = None
-        pending_name: str | None = None
-        debounce_deadline = 0.0
         force_flip = False
-
-        active_url: str | None = None
-
-        tuning_started_at = 0.0
-        tune_attempts = 0
 
         self.watch = WatchdogWorker(self.tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
         self.watch.start()
@@ -194,7 +179,7 @@ class FPTV:
         while running:
             clock.tick(60)
 
-            # Drain queue
+            # --- Handle input events ---
             while True:
                 try:
                     hwEvent = self.event_queue.get_nowait()
@@ -209,22 +194,20 @@ class FPTV:
 
                 if ev == Event.PRESS:
                     if mode == Screen.MENU:
-                        # Start video mode. If we don't have an active channel yet, tune to current selection.
+                        # Start video mode
                         self.mpv.resume()
                         if self.state.channels:
                             ch = self.state.channels[self.state.browse_index]
-                            pending_name = f"Channel: {ch.name}"
-                            pending_url = ch.url
-                            debounce_deadline = time.time()  # tune immediately
-                            self.overlays.set_channel_name(pending_name, seconds=3.0)
+                            self.tuner.tune_now(ch.url, f"Channel: {ch.name}")
+                            self.overlays.set_channel_name(f"Channel: {ch.name}", seconds=3.0)
                             mode = Screen.TUNE
-                            tuning_started_at = time.time()
-                            active_url = ch.url
                         else:
                             mode = Screen.PLAY
                         force_flip = True
                     else:
+                        # Return to menu
                         mode = Screen.MENU
+                        self.tuner.cancel()
                         self.mpv.pause()
                         force_flip = True
 
@@ -240,69 +223,53 @@ class FPTV:
                         self.overlays.set_channel_name(f"Channel: {channel.name}", seconds=3.0)
                         force_flip = True
 
-                        # If we're in video mode, schedule a debounced tune to the newly selected channel.
+                        # If in video mode, request debounced tune
                         if mode in (Screen.PLAY, Screen.TUNE):
-                            pending_url = channel.url
-                            pending_name = f"Channel: {channel.name}"
-                            debounce_deadline = time.time() + DEBOUNCE_S
+                            self.tuner.request_tune(channel.url, f"Channel: {channel.name}")
+
                     elif ev_src == ENCODER_VOLUME_NAME:
                         delta = 5 if ev == Event.ROT_R else -5
                         self.mpv.add_volume(delta)
 
-            # Render
+            # --- Render ---
             init_viewport(self.w, self.h)
-            now = time.time()
 
             if mode in (Screen.PLAY, Screen.TUNE):
                 clear_screen()
 
-                # Render mpv if it has a new frame ready.
+                # Render mpv frame
                 did_render = self.mpv.maybe_render(self.w, self.h)
 
-                # Overlays (channel name / volume / messages)
+                # Tick tuner state machine
+                tune_status = self.tuner.tick(did_render)
+
+                # Update mode based on tuner state
+                if tune_status.state == TunerState.PLAYING:
+                    mode = Screen.PLAY
+                elif tune_status.state == TunerState.TUNING:
+                    mode = Screen.TUNE
+                elif tune_status.state == TunerState.FAILED:
+                    self.overlays.set_channel_name("No signal", seconds=3.0)
+                    self.mpv.pause()
+                    mode = Screen.MENU
+                    force_flip = True
+
+                # Show status messages (Retrying…, etc.)
+                if tune_status.message:
+                    seconds = 5.0 if tune_status.message == "Retrying…" else 3.0
+                    self.overlays.set_channel_name(tune_status.message, seconds=seconds)
+                    force_flip = True
+
+                # Overlays
                 self.overlays.tick()
                 self.overlays.draw()
 
-                # Fire a debounced tune request.
-                if pending_url and now >= debounce_deadline:
-                    active_url = pending_url
-                    active_name = pending_name or ""
-                    pending_url = None
+                # --- Watchdog integration ---
+                self.watch.expecting = self.tuner.is_expecting_video
+                self.watch.current_url = self.tuner.current_url
+                self.watch.tuning_started_at = self.tuner.tune_started_at
 
-                    self.log.out(f"Tune to channel: {active_name}")
-                    self.mpv.loadfile_now(active_url)
-                    tuning_started_at = now
-                    tune_attempts = 0
-                    mode = Screen.TUNE
-                    force_flip = True
-
-                # If we got *any* new frame while tuning, consider the tune successful.
-                if mode == Screen.TUNE and did_render and (now - tuning_started_at) > 0.2:
-                    mode = Screen.PLAY
-
-                # Tune timeout / retries (handles 'No input detected' cases)
-                if mode == Screen.TUNE and (now - tuning_started_at) > TUNE_TIMEOUT_S:
-                    if tune_attempts < MAX_TUNE_RETRIES:
-                        tune_attempts += 1
-                        tuning_started_at = now
-                        self.log.out(f"Tune timeout; retry {tune_attempts}/{MAX_TUNE_RETRIES}")
-                        self.overlays.set_channel_name("Retrying…", seconds=5.0)
-                        if active_url:
-                            self.mpv.loadfile_now(active_url)
-                        force_flip = True
-                    else:
-                        self.log.out("Tune failed; returning to menu")
-                        self.overlays.set_channel_name("No signal", seconds=3.0)
-                        self.mpv.pause()
-                        mode = Screen.MENU
-                        force_flip = True
-
-                # --- publish minimal state to watchdog worker (EVERY FRAME is fine; it's just assignments) ---
-                self.watch.expecting = (mode in (Screen.TUNE, Screen.PLAY))
-                self.watch.current_url = active_url
-                self.watch.tuning_started_at = tuning_started_at
-
-                # --- drain watchdog actions ---
+                # Drain watchdog actions
                 while True:
                     try:
                         action, url, reason = self.watch.actions.get_nowait()
@@ -310,21 +277,18 @@ class FPTV:
                         break
 
                     if action == "reload" and url:
-                        self.log.out(f"Watchdog reload: {reason}")
-                        self.mpv.stop()
-                        self.mpv.loadfile_now(url)
-                        tuning_started_at = time.time()
+                        self.tuner.reload(reason)
                         mode = Screen.TUNE
                         force_flip = True
 
-                # --- PRESENT (this must not be inside the watchdog loop) ---
+                # Present
                 if did_render or force_flip:
                     pygame.display.flip()
                     self.mpv.report_swap()
                     force_flip = False
 
             else:
-                # MENU: draw menu into texture and present
+                # MENU: draw menu and present
                 draw_menu_surface(menu_surf, self.font_item, "Press button to toggle video")
                 self.renderer.update_from_surface(menu_surf)
 
@@ -333,7 +297,7 @@ class FPTV:
                 pygame.display.flip()
                 self.mpv.report_swap()
 
-            # Let mpv advance any pending tune (non-blocking)
+            # Let mpv process pending commands
             self.mpv.tick()
 
         self.shutdown()
