@@ -416,11 +416,6 @@ class EmbeddedMPV:
         self._pending_url = url
         self._switch_after = 0.0
 
-    def show_text(self, text: str, duration_ms: int = 1000) -> None:
-        """Display mpv OSD text (great for a volume overlay)."""
-        # show-text: args are (text, duration-ms[, level])
-        self._exec("show-text", text, str(duration_ms))
-
     def add_volume(self, delta: int) -> None:
         """
         Adjust volume and show an overlay.
@@ -499,7 +494,7 @@ class EmbeddedMPV:
         return rc
 
     def _on_mpv_update(self, _ctx: c_void_p) -> None:
-        # IMPORTANT: don't call mpv APIs here. Just signal your main loop.
+        # Don't call any mpv API here.
         self._update_event.set()
 
     def _get_proc_address(self, _ctx: c_void_p, name: bytes) -> c_void_p:
