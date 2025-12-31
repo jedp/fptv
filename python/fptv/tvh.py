@@ -124,16 +124,18 @@ class TVHeadendScanner:
     def __init__(self, config: ScanConfig):
         self.log = Logger("tvh")
         self.config = config
-        self.auth = None
+
+        # Use a session for connection pooling
+        self._session = requests.Session()
         if config.user and config.password:
-            self.auth = HTTPDigestAuth(config.user, config.password)
+            self._session.auth = HTTPDigestAuth(config.user, config.password)
 
     def _request(self, method: str, endpoint: str, **kwargs) -> requests.Response | None:
         """
         Make an authenticated request to TVHeadend API with sane defaults + simple retry.
+        Uses session for connection pooling.
         """
         url = f"{self.config.base_url}{endpoint}"
-        kwargs.setdefault("auth", self.auth)
         kwargs.setdefault("timeout", 10)
 
         # Light retry for transient 5xx / connection hiccups.
@@ -141,13 +143,13 @@ class TVHeadendScanner:
         resp = None
         for i in range(attempts):
             try:
-                with requests.request(method, url, **kwargs) as resp:
+                resp = self._session.request(method, url, **kwargs)
 
-                    if resp.status_code >= 500 and i < attempts - 1:
-                        time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
-                        continue
+                if resp.status_code >= 500 and i < attempts - 1:
+                    time.sleep(0.2 * (2 ** i) + random.random() * 0.1)
+                    continue
 
-                    return resp
+                return resp
 
             except requests.RequestException:
                 if i == attempts - 1:
