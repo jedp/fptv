@@ -216,7 +216,7 @@ class FPTV:
                             pending_name = f"Channel: {ch.name}"
                             pending_url = ch.url
                             debounce_deadline = time.time()  # tune immediately
-                            self.overlays.set_channel_name(pending_name)
+                            self.overlays.set_channel_name(pending_name, seconds=3.0)
                             mode = Screen.TUNE
                             tuning_started_at = time.time()
                             active_url = ch.url
@@ -237,7 +237,7 @@ class FPTV:
                         i = max(0, min(len(self.state.channels) - 1, i))
                         self.state.browse_index = i
                         channel = self.state.channels[self.state.browse_index]
-                        self.overlays.set_channel_name(f"Channel: {channel.name}")
+                        self.overlays.set_channel_name(f"Channel: {channel.name}", seconds=3.0)
                         force_flip = True
 
                         # If we're in video mode, schedule a debounced tune to the newly selected channel.
@@ -286,13 +286,13 @@ class FPTV:
                         tune_attempts += 1
                         tuning_started_at = now
                         self.log.out(f"Tune timeout; retry {tune_attempts}/{MAX_TUNE_RETRIES}")
-                        self.overlays.set_channel_name("Retrying…")
+                        self.overlays.set_channel_name("Retrying…", seconds=5.0)
                         if active_url:
                             self.mpv.loadfile_now(active_url)
                         force_flip = True
                     else:
                         self.log.out("Tune failed; returning to menu")
-                        self.overlays.set_channel_name("No signal")
+                        self.overlays.set_channel_name("No signal", seconds=3.0)
                         self.mpv.pause()
                         mode = Screen.MENU
                         force_flip = True
