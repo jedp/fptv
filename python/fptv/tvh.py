@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -67,6 +68,7 @@ SETTLE_AFTER_PRUNE_SECS = 1.0  # After pruning/cleanup to avoid retune flakiness
 class Channel:
     name: str
     url: str
+    uuid: str = ""  # Channel UUID for EPG lookup (from tvg-id in playlist)
 
 
 @dataclass
@@ -1110,6 +1112,10 @@ class TVHeadendScanner:
 
         channels = []
         name = None
+        uuid = ""
+
+        # Regex to extract tvg-id from EXTINF line
+        tvg_id_pattern = re.compile(r'tvg-id="([^"]*)"')
 
         for line in resp.text.splitlines():
             if not line.strip():
@@ -1119,13 +1125,18 @@ class TVHeadendScanner:
                 continue
 
             elif line.startswith('#EXTINF'):
+                # Extract channel name (after the comma)
                 name = line.strip().split(',')[-1].strip()
+                # Extract tvg-id (channel UUID)
+                match = tvg_id_pattern.search(line)
+                uuid = match.group(1) if match else ""
 
             elif line.startswith('http://'):
                 if name is None:
                     raise ValueError(f"No name found before url: {line}")
-                channels.append(Channel(name, line))
+                channels.append(Channel(name, line, uuid))
                 name = None
+                uuid = ""
 
             else:
                 raise ValueError(f"Unexpected m3u line: {line}")
@@ -1556,8 +1567,8 @@ class TVHeadendScanner:
     # -------------------------------------------------------------------------
 
     def _scan_ensure_network_ready(
-        self,
-        log: Callable[[str], None],
+            self,
+            log: Callable[[str], None],
     ) -> str | None:
         """Step 1: Find network and ensure frontends are configured."""
         log(f"Finding network UUID for: {self.config.net_name}")
@@ -1573,9 +1584,9 @@ class TVHeadendScanner:
         return net_uuid
 
     def _scan_wipe_existing_muxes(
-        self,
-        net_uuid: str,
-        log: Callable[[str], None],
+            self,
+            net_uuid: str,
+            log: Callable[[str], None],
     ) -> None:
         """Step 2: Wipe existing muxes if configured."""
         if not self.config.wipe_existing_muxes:
@@ -1587,9 +1598,9 @@ class TVHeadendScanner:
         log(f"Deleted {len(muxes)} muxes.")
 
     def _scan_create_muxes(
-        self,
-        net_uuid: str,
-        log: Callable[[str], None],
+            self,
+            net_uuid: str,
+            log: Callable[[str], None],
     ) -> int:
         """Step 3: Create ATSC muxes for RF channel range."""
         log(f"Creating ATSC muxes RF {self.config.rf_start}..{self.config.rf_end} (modulation={self.config.modulation})...")
@@ -1614,9 +1625,9 @@ class TVHeadendScanner:
         return created_count
 
     def _scan_force_scan_muxes(
-        self,
-        net_uuid: str,
-        log: Callable[[str], None],
+            self,
+            net_uuid: str,
+            log: Callable[[str], None],
     ) -> None:
         """Step 4: Force scan on all muxes in network."""
         log("Forcing scan on all muxes in network...")
@@ -1626,9 +1637,9 @@ class TVHeadendScanner:
         log(f"Requested scan for {len(muxes)} muxes.")
 
     def _scan_wait_for_completion(
-        self,
-        net_uuid: str,
-        log: Callable[[str, MuxStates | None], None],
+            self,
+            net_uuid: str,
+            log: Callable[[str, MuxStates | None], None],
     ) -> bool:
         """Step 5: Poll until scan settles or times out. Returns True if settled."""
         log(f"Polling scan progress (timeout {self.config.timeout_secs}s)...", None)
@@ -1659,9 +1670,9 @@ class TVHeadendScanner:
         return True
 
     def _scan_cleanup_channels(
-        self,
-        net_uuid: str,
-        log: Callable[[str], None],
+            self,
+            net_uuid: str,
+            log: Callable[[str], None],
     ) -> None:
         """Step 6: Clean up channels - delete orphans, map services, deduplicate."""
         # Delete orphan channels (no services attached)
@@ -1715,6 +1726,7 @@ class TVHeadendScanner:
         Returns:
             True if scan completed successfully, False otherwise.
         """
+
         # Log helper that routes to callback or self.log
         def log(msg: str, states: Optional[MuxStates] = None):
             if progress_callback:
