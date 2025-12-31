@@ -229,8 +229,9 @@ class FPTV:
             if mode in (Screen.PLAY, Screen.TUNE):
                 clear_screen()
 
-                # Render video frame and tick tuner state machine
-                tune_status = self.tuner.render_tick(self.w, self.h)
+                # Render video frame, then tick tuner state machine
+                did_render = self.tuner.render_frame(self.w, self.h)
+                tune_status = self.tuner.tick(did_render)
 
                 # Update mode based on tuner state
                 if tune_status.state == TunerState.PLAYING:
@@ -271,7 +272,7 @@ class FPTV:
                         force_flip = True
 
                 # Present
-                if tune_status.did_render or force_flip:
+                if did_render or force_flip:
                     pygame.display.flip()
                     self.tuner.report_swap()
                     force_flip = False
