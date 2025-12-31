@@ -496,6 +496,144 @@ def clear_screen() -> None:
     GL.glClear(GL_COLOR_BUFFER_BIT)
 
 
+# -----------------------------------------------------------------------------
+# Screen drawing functions
+# -----------------------------------------------------------------------------
+
+def draw_main_menu(
+        surface: pygame.Surface,
+        title_font: pygame.font.Font,
+        item_font: pygame.font.Font,
+        items: list[str],
+        selected: int,
+) -> None:
+    """Draw the main menu with FPTV title and selectable options."""
+    surface.fill(BG_NORM)
+
+    # Title: "FP" in yellow, "TV" in blue
+    text_fp = title_font.render("FP", True, FG_ACCENT_YELLOW)
+    text_tv = title_font.render("TV", True, FG_ACCENT_BLUE)
+    x, y = 60, 40
+    surface.blit(text_fp, (x, y))
+    surface.blit(text_tv, (x + text_fp.get_width(), y))
+
+    # Menu items
+    start_y = 180
+    line_h = 70
+    pad_x = 60
+
+    for i, text in enumerate(items):
+        is_sel = (i == selected)
+        bg_color = BG_SEL if is_sel else BG_NORM
+        fg_color = FG_SEL if is_sel else FG_NORM
+
+        item_y = start_y + i * line_h
+        rect = pygame.Rect(0, item_y, surface.get_width(), line_h)
+        pygame.draw.rect(surface, bg_color, rect)
+
+        text_surf = item_font.render(text, True, fg_color)
+        text_rect = text_surf.get_rect(midleft=(pad_x, item_y + line_h // 2))
+        surface.blit(text_surf, text_rect)
+
+
+def draw_browse(
+        surface: pygame.Surface,
+        item_font: pygame.font.Font,
+        channels: list,  # List[Channel]
+        selected: int,
+) -> None:
+    """Draw the channel browser with scrolling list."""
+    surface.fill(BG_NORM)
+
+    # Header
+    header_font = item_font
+    header = header_font.render("Channels", True, FG_ACCENT_BLUE)
+    surface.blit(header, (20, 10))
+
+    if not channels:
+        # No channels message
+        msg = item_font.render("No channels found", True, FG_ALERT)
+        msg_rect = msg.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+        surface.blit(msg, msg_rect)
+        return
+
+    # Calculate visible window
+    h = surface.get_height()
+    header_h = 70
+    line_h = 52
+    visible = max(1, (h - header_h) // line_h)
+    half = visible // 2
+
+    # Center selection in visible window
+    start = max(0, selected - half)
+    end = min(len(channels), start + visible)
+    start = max(0, end - visible)
+
+    y0 = header_h
+    for row, idx in enumerate(range(start, end)):
+        channel = channels[idx]
+        is_sel = (idx == selected)
+        fg_color = FG_SEL if is_sel else FG_NORM
+        bg_color = BG_SEL if is_sel else BG_NORM
+
+        item_y = y0 + row * line_h
+        rect = pygame.Rect(0, item_y, surface.get_width(), line_h)
+        pygame.draw.rect(surface, bg_color, rect)
+
+        # Channel name (short name like "7.1 KQED")
+        text_surf = item_font.render(channel.name, True, fg_color)
+        text_rect = text_surf.get_rect(midleft=(20, item_y + line_h // 2))
+        surface.blit(text_surf, text_rect)
+
+
+def draw_about(
+        surface: pygame.Surface,
+        title_font: pygame.font.Font,
+        item_font: pygame.font.Font,
+        info: dict[str, str],
+) -> None:
+    """Draw the about screen with device information."""
+    surface.fill(BG_NORM)
+
+    # Title
+    title = title_font.render("About", True, FG_ACCENT_BLUE)
+    surface.blit(title, (60, 40))
+
+    # Info lines
+    y = 160
+    line_h = 50
+
+    for key, value in info.items():
+        # Key in dim color, value in bright
+        key_surf = item_font.render(f"{key}:", True, FG_INACT)
+        val_surf = item_font.render(value, True, FG_NORM)
+
+        surface.blit(key_surf, (40, y))
+        surface.blit(val_surf, (40 + key_surf.get_width() + 20, y))
+        y += line_h
+
+
+def draw_scan(
+        surface: pygame.Surface,
+        title_font: pygame.font.Font,
+        item_font: pygame.font.Font,
+        status: str = "Not implemented yet",
+) -> None:
+    """Draw the scan screen (placeholder for now)."""
+    surface.fill(BG_NORM)
+
+    title = title_font.render("Scan", True, FG_ACCENT_BLUE)
+    surface.blit(title, (60, 40))
+
+    msg = item_font.render(status, True, FG_NORM)
+    msg_rect = msg.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+    surface.blit(msg, msg_rect)
+
+
+# -----------------------------------------------------------------------------
+# Legacy/reference code (commented)
+# -----------------------------------------------------------------------------
+
 """
 def draw_menu(surface, title_font, item_font,
               items: List[str], selected: int):
