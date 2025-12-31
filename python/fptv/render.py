@@ -640,8 +640,9 @@ def draw_browse(
         surface.blit(text_surf, text_rect)
 
         # EPG program title (right side, if available)
-        if epg_map and channel.uuid:
-            epg_event = epg_map.get(channel.uuid)
+        # EPG map is keyed by channel name (not UUID)
+        if epg_map:
+            epg_event = epg_map.get(channel.name)
             if epg_event and epg_event.title:
                 title = epg_event.title
 
