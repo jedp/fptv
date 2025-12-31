@@ -56,6 +56,13 @@ def json_dumps(obj: object) -> str:
     return json.dumps(obj, separators=(',', ':'), ensure_ascii=False)
 
 
+# Scan settle delays - TVHeadend needs time to process changes before next step
+SETTLE_AFTER_SCAN_SECS = 2.0  # After mux scans complete
+SETTLE_AFTER_DISABLE_SECS = 0.5  # After disabling failed muxes
+SETTLE_AFTER_MAPPING_SECS = 1.0  # After service-to-channel mapping
+SETTLE_AFTER_PRUNE_SECS = 1.0  # After pruning/cleanup to avoid retune flakiness
+
+
 @dataclass(frozen=True)
 class Channel:
     name: str
@@ -1635,7 +1642,7 @@ class TVHeadendScanner:
             time.sleep(self.config.sleep_secs)
 
         log("Sleeping to let tvheadend settle...")
-        time.sleep(2.0)
+        time.sleep(SETTLE_AFTER_SCAN_SECS)
 
         # Step 6: Start service mapping
         # In order:
@@ -1654,7 +1661,7 @@ class TVHeadendScanner:
         log("Disabling failed muxes")
         self.disable_failed_muxes(net_uuid)
         log("Sleeping to let service graph settle...")
-        time.sleep(0.5)
+        time.sleep(SETTLE_AFTER_DISABLE_SECS)
 
         # At this point, services are authoritative, channel names come from svcname,
         # and channels have valid services. So we can now map services to channels.
@@ -1676,7 +1683,7 @@ class TVHeadendScanner:
         log(f"Dedup stats: {dedup_stats}")
 
         log("Sleeping to let tuners and table decoding settle...")
-        time.sleep(1)
+        time.sleep(SETTLE_AFTER_MAPPING_SECS)
 
         log("Debug: Health check ...")
         self.debug_channel_service_mux_health(net_uuid)
@@ -1685,7 +1692,7 @@ class TVHeadendScanner:
         prune_stats = self.prune_invalid_services_per_channel(net_uuid)
         log(f"Prune stats: {prune_stats}")
         log("Sleeping to reduce flakiness due to immediate retuning after write...")
-        time.sleep(1)  # Reduce "immediate retune after write" flakiness.
+        time.sleep(SETTLE_AFTER_PRUNE_SECS)
 
         log("Done with scan.")
 
