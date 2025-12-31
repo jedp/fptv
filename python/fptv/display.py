@@ -10,7 +10,8 @@ import pygame
 from fptv.log import Logger
 from fptv.render import (
     GLMenuRenderer, OverlayManager, init_viewport, clear_screen,
-    draw_menu_surface, make_text_overlay, make_volume_overlay,
+    make_text_overlay, make_volume_overlay,
+    draw_main_menu, draw_browse, draw_about, draw_scan,
 )
 from fptv.tuner import Tuner
 
@@ -25,7 +26,7 @@ class Display:
     Owns all rendering concerns:
     - pygame display initialization
     - Fonts
-    - GLMenuRenderer (menu screen)
+    - GLMenuRenderer (menu screens)
     - OverlayManager (channel name, volume HUD)
     - Flip/swap coordination
 
@@ -34,10 +35,11 @@ class Display:
         tuner = Tuner(tvh)  # needs GL context from display
         display.set_tuner(tuner)
 
-        # In mainloop:
-        display.render_video(force_flip=False)
-        # or
-        display.render_menu()
+        # Render different screens:
+        display.render_main_menu(items, selected)
+        display.render_browse(channels, selected)
+        display.render_about(info)
+        display.render_video(force_flip)
 
         # Overlays:
         display.show_channel_name("PBS", seconds=3.0)
@@ -124,15 +126,47 @@ class Display:
 
         return False, did_render
 
-    def render_menu(self, subtitle: str = "Press button to toggle video") -> None:
-        """
-        Render menu screen and present.
-
-        Always flips - menu is not frame-rate sensitive like video.
-        """
+    def render_main_menu(self, items: list[str], selected: int) -> None:
+        """Render main menu screen with selectable options."""
         init_viewport(self.w, self.h)
 
-        draw_menu_surface(self._menu_surface, self._font_item, subtitle)
+        draw_main_menu(self._menu_surface, self._font_title, self._font_item, items, selected)
+        self._renderer.update_from_surface(self._menu_surface)
+
+        clear_screen()
+        self._renderer.draw_fullscreen()
+        pygame.display.flip()
+        self._tuner.report_swap()
+
+    def render_browse(self, channels: list, selected: int) -> None:
+        """Render channel browser screen."""
+        init_viewport(self.w, self.h)
+
+        draw_browse(self._menu_surface, self._font_item, channels, selected)
+        self._renderer.update_from_surface(self._menu_surface)
+
+        clear_screen()
+        self._renderer.draw_fullscreen()
+        pygame.display.flip()
+        self._tuner.report_swap()
+
+    def render_about(self, info: dict[str, str]) -> None:
+        """Render about screen with device info."""
+        init_viewport(self.w, self.h)
+
+        draw_about(self._menu_surface, self._font_title, self._font_item, info)
+        self._renderer.update_from_surface(self._menu_surface)
+
+        clear_screen()
+        self._renderer.draw_fullscreen()
+        pygame.display.flip()
+        self._tuner.report_swap()
+
+    def render_scan(self, status: str = "Not implemented yet") -> None:
+        """Render scan screen (placeholder)."""
+        init_viewport(self.w, self.h)
+
+        draw_scan(self._menu_surface, self._font_title, self._font_item, status)
         self._renderer.update_from_surface(self._menu_surface)
 
         clear_screen()
