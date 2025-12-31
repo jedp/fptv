@@ -150,11 +150,12 @@ class Display:
         pygame.display.flip()
         self._tuner.report_swap()
 
-    def render_about(self, info: dict[str, str]) -> None:
-        """Render about screen with device info."""
+    def render_about(self, info: dict[str, str], selected: int = 0) -> None:
+        """Render about screen with device info. selected=-1 means Back."""
         init_viewport(self.w, self.h)
 
-        draw_about(self._menu_surface, self._font_title, self._font_item, info)
+        draw_about(self._menu_surface, self._font_title, self._font_item, info, 
+                   back_selected=(selected == -1))
         self._renderer.update_from_surface(self._menu_surface)
 
         clear_screen()
@@ -162,11 +163,12 @@ class Display:
         pygame.display.flip()
         self._tuner.report_swap()
 
-    def render_scan(self, status: str = "Not implemented yet") -> None:
-        """Render scan screen (placeholder)."""
+    def render_scan(self, status: str = "Not implemented yet", selected: int = 0) -> None:
+        """Render scan screen (placeholder). selected=-1 means Back."""
         init_viewport(self.w, self.h)
 
-        draw_scan(self._menu_surface, self._font_title, self._font_item, status)
+        draw_scan(self._menu_surface, self._font_title, self._font_item, status,
+                  back_selected=(selected == -1))
         self._renderer.update_from_surface(self._menu_surface)
 
         clear_screen()
