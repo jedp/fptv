@@ -2,17 +2,17 @@
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from queue import SimpleQueue, Empty
+from queue import SimpleQueue
 from typing import List
 
 import pygame
 
-from fptv.event import Event
-from fptv.hw import HwEventBinding, ENCODER_CHANNEL_NAME, ENCODER_VOLUME_NAME
+from fptv.hw import HwEventBinding
+from fptv.input import Action, InputMapper
 from fptv.log import Logger
-from fptv.tuner import Tuner, TunerState
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
+from fptv.tuner import Tuner, TunerState
 from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
 
 FPTV_CAPTION = "fptv"
@@ -51,9 +51,10 @@ class FPTV:
         self.w = screen_w
         self.h = screen_h
         self.log = Logger("fptv")
-        self.event_queue = SimpleQueue()
+        self._event_queue = SimpleQueue()
         self.tvh = TVHeadendScanner(ScanConfig.from_env())
-        self.hw = HwEventBinding(self.event_queue)
+        self.hw = HwEventBinding(self._event_queue)
+        self.input = InputMapper(self._event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
 
         pygame.init()
@@ -104,20 +105,12 @@ class FPTV:
         while running:
             clock.tick(60)
 
-            # --- Handle input events ---
-            while True:
-                try:
-                    hwEvent = self.event_queue.get_nowait()
-                except Empty:
-                    break
-
-                ev_src = hwEvent.source
-                ev = hwEvent.event
-
-                if ev == Event.QUIT:
+            # --- Handle input actions ---
+            for action in self.input.poll():
+                if action == Action.QUIT:
                     running = False
 
-                if ev == Event.PRESS:
+                elif action == Action.TOGGLE_MODE:
                     if mode == Screen.MENU:
                         # Start video mode
                         self.tuner.resume()
@@ -136,25 +129,27 @@ class FPTV:
                         self.tuner.pause()
                         force_flip = True
 
-                if ev == Event.ROT_L or ev == Event.ROT_R:
-                    if ev_src == ENCODER_CHANNEL_NAME:
-                        if not self.state.channels:
-                            continue
+                elif action in (Action.NEXT_CHANNEL, Action.PREV_CHANNEL):
+                    if not self.state.channels:
+                        continue
 
-                        i = self.state.browse_index + (1 if ev == Event.ROT_R else -1)
-                        i = max(0, min(len(self.state.channels) - 1, i))
-                        self.state.browse_index = i
-                        channel = self.state.channels[self.state.browse_index]
-                        self.overlays.set_channel_name(f"Channel: {channel.name}", seconds=3.0)
-                        force_flip = True
+                    delta = 1 if action == Action.NEXT_CHANNEL else -1
+                    i = self.state.browse_index + delta
+                    i = max(0, min(len(self.state.channels) - 1, i))
+                    self.state.browse_index = i
+                    channel = self.state.channels[self.state.browse_index]
+                    self.overlays.set_channel_name(f"Channel: {channel.name}", seconds=3.0)
+                    force_flip = True
 
-                        # If in video mode, request debounced tune
-                        if mode in (Screen.PLAY, Screen.TUNE):
-                            self.tuner.request_tune(channel.url, f"Channel: {channel.name}")
+                    # If in video mode, request debounced tune
+                    if mode in (Screen.PLAY, Screen.TUNE):
+                        self.tuner.request_tune(channel.url, f"Channel: {channel.name}")
 
-                    elif ev_src == ENCODER_VOLUME_NAME:
-                        delta = 5 if ev == Event.ROT_R else -5
-                        self.tuner.add_volume(delta)
+                elif action == Action.VOLUME_UP:
+                    self.tuner.add_volume(5)
+
+                elif action == Action.VOLUME_DOWN:
+                    self.tuner.add_volume(-5)
 
             # --- Render ---
             init_viewport(self.w, self.h)
