@@ -458,36 +458,9 @@ class TVHeadendScanner:
         self.log.out(f"debug_channel_service_mux_health: {counts}")
         return counts
 
-    def get_mux_health_for_network(self, net_uuid: str) -> dict[str, dict]:
-        """
-        Robust: accept network_uuid OR (when only network name is present) match by your config.net_name.
-        """
-        data = self._get_json("/api/mpegts/mux/grid?limit=99999")
-        out: dict[str, dict] = {}
-
-        for e in data.get("entries", []):
-            if not isinstance(e, dict):
-                continue
-
-            nu = e.get("network_uuid") or e.get("network")
-            if nu not in (net_uuid, self.config.net_name):
-                continue
-
-            mux_uuid = e.get("uuid")
-            if not isinstance(mux_uuid, str) or not mux_uuid:
-                continue
-
-            out[mux_uuid] = {
-                "enabled": bool(e.get("enabled", True)),
-                "scan_result": e.get("scan_result"),
-                "scan_state": e.get("scan_state"),
-            }
-
-        return out
-
     def get_good_muxes(self, net_uuid: str) -> Set[str]:
-        mux_health = self.get_mux_health_for_network(net_uuid)
-        return {m for (m, info) in mux_health.items() if self._mux_is_ok(info)}
+        mux_index = self.get_mux_index(net_uuid=net_uuid)
+        return {m for (m, info) in mux_index.items() if self._mux_is_ok(info)}
 
     def disable_failed_muxes(self, net_uuid: str) -> dict:
         """
@@ -1074,44 +1047,6 @@ class TVHeadendScanner:
 
         return None
 
-    def get_service_name(self, service_entry: dict) -> Optional[str]:
-        # First try lightweight list fields
-        v = self._service_param(service_entry, "svcname")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-        # Some builds put something usable in "name"
-        v = service_entry.get("name")
-        if isinstance(v, str) and v.strip():
-            # Often "ATSC OTA/569MHz/KQED-HD" — take the tail
-            s = v.strip()
-            if "/" in s:
-                s2 = s.split("/")[-1].strip()
-                if s2:
-                    return s2
-            return s
-
-        # Fall back to authoritative idnode/load
-        su = service_entry.get("uuid") or service_entry.get("id")
-        if not isinstance(su, str) or not su:
-            return None
-
-        ent = self._idnode_load_entry(su)
-        if not ent:
-            return None
-
-        params_map = self._idnode_params_to_map(ent)
-        v = params_map.get("svcname")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-        # last resort
-        v = params_map.get("name")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
-        return None
-
     def list_services(self, limit: int = 99999) -> List[dict]:
         """
         List all services.
@@ -1388,8 +1323,8 @@ class TVHeadendScanner:
         """
         channels = self.get_channel_grid()
 
-        mux_health = self.get_mux_health_for_network(net_uuid)
-        good_muxes = {m for (m, info) in mux_health.items() if self._mux_is_ok(info)}
+        mux_index = self.get_mux_index(net_uuid=net_uuid)
+        good_muxes = {m for (m, info) in mux_index.items() if self._mux_is_ok(info)}
         svc_to_mux = self.get_service_to_mux_map()
 
         # Group by name
