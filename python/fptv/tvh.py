@@ -72,6 +72,15 @@ class Channel:
 
 
 @dataclass
+class EPGEvent:
+    """A currently-airing program from the EPG."""
+    channel_uuid: str
+    title: str
+    start: int  # Unix timestamp
+    stop: int  # Unix timestamp
+
+
+@dataclass
 class ScanConfig:
     base_url: str = "http://127.0.0.1:9981"
     net_name: str = "ATSC OTA"
@@ -1142,6 +1151,52 @@ class TVHeadendScanner:
                 raise ValueError(f"Unexpected m3u line: {line}")
 
         return channels
+
+    def get_epg_now(self) -> dict[str, EPGEvent]:
+        """
+        Fetch currently-airing programs from the EPG.
+
+        Returns:
+            Dict mapping channel_uuid -> EPGEvent for channels with current programming.
+            Channels without EPG data are not included in the result.
+        """
+        now = int(time.time())
+
+        try:
+            # Fetch EPG events - TVH returns all events, we filter for "now"
+            data = self._get_json("/api/epg/events/grid", params={
+                "start": 0,
+                "limit": 1000,  # Reasonable upper bound
+            })
+        except Exception as e:
+            self.log.err(f"get_epg_now: {e}")
+            return {}
+
+        result: dict[str, EPGEvent] = {}
+
+        for entry in data.get("entries", []):
+            channel_uuid = entry.get("channelUuid") or ""
+            if not channel_uuid:
+                continue
+
+            start = int(entry.get("start", 0))
+            stop = int(entry.get("stop", 0))
+            title = entry.get("title") or ""
+
+            # Check if this event is currently airing
+            if start <= now < stop and title:
+                # Only keep one event per channel (the current one)
+                # If multiple match, prefer the one that started most recently
+                existing = result.get(channel_uuid)
+                if existing is None or start > existing.start:
+                    result[channel_uuid] = EPGEvent(
+                        channel_uuid=channel_uuid,
+                        title=title,
+                        start=start,
+                        stop=stop,
+                    )
+
+        return result
 
     def get_channel_grid(self, limit: int = 99999) -> List[dict]:
         """
