@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from queue import SimpleQueue
 
@@ -10,7 +11,7 @@ from fptv.hw import HwEventBinding
 from fptv.input import Action, InputMapper
 from fptv.log import Logger
 from fptv.tuner import Tuner, TunerState
-from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
+from fptv.tvh import Channel, EPGEvent, TVHeadendScanner, ScanConfig
 
 
 class Screen(Enum):
@@ -28,15 +29,22 @@ MENU_OPTIONS = ["Browse", "Scan", "About"]
 VOLUME_INCREMENT = 5
 VOLUME_DECREMENT = -5
 
+# EPG refresh interval (seconds) - fetch "now playing" data periodically on Browse screen
+EPG_REFRESH_SECS = 60.0
+
 
 @dataclass
 class State:
     screen: Screen = Screen.MENU
-    menu_index: int = 0       # Main menu selection (0=Browse, 1=Scan, 2=About)
-    browse_index: int = 0     # Channel list selection (-1 = Back)
-    about_index: int = 0      # About screen (-1 = Back, 0 = content)
-    scan_index: int = 0       # Scan screen (-1 = Back, 0 = content)
+    menu_index: int = 0  # Main menu selection (0=Browse, 1=Scan, 2=About)
+    browse_index: int = 0  # Channel list selection (-1 = Back)
+    about_index: int = 0  # About screen (-1 = Back, 0 = content)
+    scan_index: int = 0  # Scan screen (-1 = Back, 0 = content)
     channels: list[Channel] | None = None
+
+    # EPG (now playing) data
+    epg_map: dict[str, EPGEvent] = field(default_factory=dict)
+    epg_fetched_at: float = 0.0
 
     def __post_init__(self):
         if self.channels is None:
@@ -127,7 +135,16 @@ class FPTV:
                 self.display.render_main_menu(MENU_OPTIONS, self.state.menu_index)
 
             elif self.state.screen == Screen.BROWSE:
-                self.display.render_browse(self.state.channels, self.state.browse_index)
+                # Refresh EPG data periodically
+                if time.time() - self.state.epg_fetched_at > EPG_REFRESH_SECS:
+                    self.state.epg_map = self.tvh.get_epg_now()
+                    self.state.epg_fetched_at = time.time()
+
+                self.display.render_browse(
+                    self.state.channels,
+                    self.state.browse_index,
+                    self.state.epg_map,
+                )
 
             elif self.state.screen == Screen.ABOUT:
                 self.display.render_about(self._get_about_info(), self.state.about_index)

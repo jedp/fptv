@@ -582,6 +582,7 @@ def draw_browse(
         item_font: pygame.font.Font,
         channels: list,  # List[Channel]
         selected: int,  # -1 = Back selected, 0+ = channel index
+        epg_map: dict = None,  # Optional: {channel_uuid: EPGEvent}
 ) -> None:
     """Draw the channel browser with scrolling list. selected=-1 means Back."""
     surface.fill(BG_NORM)
@@ -597,6 +598,7 @@ def draw_browse(
         return
 
     # Calculate visible window (only for channel items, not Back)
+    w = surface.get_width()
     h = surface.get_height()
     line_h = 52
     visible = max(1, (h - header_h) // line_h)
@@ -614,21 +616,47 @@ def draw_browse(
 
     end = min(start + visible, total)
 
+    # Layout constants
+    pad_x = 20
+    channel_name_width = 200  # Reserve space for channel name
+    epg_x = pad_x + channel_name_width + 20  # EPG title starts here
+    epg_max_width = w - epg_x - pad_x  # Max width for EPG text
+
     y0 = header_h
     for row, idx in enumerate(range(start, end)):
         channel = channels[idx]
         is_sel = (idx == selected)  # Only highlight if this channel is selected (not Back)
         fg_color = FG_SEL if is_sel else FG_NORM
         bg_color = BG_SEL if is_sel else BG_NORM
+        epg_fg = FG_SEL if is_sel else FG_INACT  # Dimmer color for EPG when not selected
 
         item_y = y0 + row * line_h
-        rect = pygame.Rect(0, item_y, surface.get_width(), line_h)
+        rect = pygame.Rect(0, item_y, w, line_h)
         pygame.draw.rect(surface, bg_color, rect)
 
-        # Channel name (short name like "7.1 KQED")
+        # Channel name (left side)
         text_surf = item_font.render(channel.name, True, fg_color)
-        text_rect = text_surf.get_rect(midleft=(20, item_y + line_h // 2))
+        text_rect = text_surf.get_rect(midleft=(pad_x, item_y + line_h // 2))
         surface.blit(text_surf, text_rect)
+
+        # EPG program title (right side, if available)
+        if epg_map and channel.uuid:
+            epg_event = epg_map.get(channel.uuid)
+            if epg_event and epg_event.title:
+                title = epg_event.title
+
+                # Truncate if too long
+                epg_surf = item_font.render(title, True, epg_fg)
+                if epg_surf.get_width() > epg_max_width:
+                    # Truncate with ellipsis
+                    while title and epg_surf.get_width() > epg_max_width:
+                        title = title[:-1]
+                        epg_surf = item_font.render(title + "...", True, epg_fg)
+                    title = title + "..." if title else ""
+                    epg_surf = item_font.render(title, True, epg_fg)
+
+                epg_rect = epg_surf.get_rect(midleft=(epg_x, item_y + line_h // 2))
+                surface.blit(epg_surf, epg_rect)
 
 
 def draw_about(
