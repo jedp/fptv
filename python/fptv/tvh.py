@@ -1168,8 +1168,6 @@ class TVHeadendScanner:
         name = None
 
         for line in resp.text.splitlines():
-            print(f"Processing /playlist/channels line {line}")
-
             if not line.strip():
                 continue
 
