@@ -1,18 +1,25 @@
 """
-Tuner: high-level video tuning interface that owns and hides EmbeddedMPV.
+Tuner: high-level video tuning interface.
 
 Encapsulates:
 - mpv lifecycle (init, render, shutdown)
 - Input debouncing (coalesces rapid channel changes)
 - Tune timeout and retry logic
 - State machine (IDLE → TUNING → PLAYING or FAILED)
+- Stream health monitoring (watchdog)
 """
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
+from queue import Empty
+from typing import TYPE_CHECKING
 
 from fptv.log import Logger
 from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
+from fptv.tvh import WatchdogWorker
+
+if TYPE_CHECKING:
+    pass
 
 
 class TunerState(Enum):
@@ -33,18 +40,21 @@ class TunerStatus:
 
 class Tuner:
     """
-    High-level video tuning controller that owns the embedded player.
+    High-level video tuning controller.
     
-    The embedded mpv player is an implementation detail.
+    Owns and hides:
+    - EmbeddedMPV (video player)
+    - WatchdogWorker (stream health monitoring)
     
     Handles:
     - mpv lifecycle (initialize, render, shutdown)
     - Input debouncing (coalesces rapid channel changes)
     - Tune timeout and retry logic
     - State machine (IDLE → TUNING → PLAYING or FAILED)
+    - Automatic stream recovery via watchdog
     
     Usage:
-        tuner = Tuner()
+        tuner = Tuner(tvh)
         tuner.initialize()
         
         # Enter video mode
@@ -59,17 +69,20 @@ class Tuner:
             tuner.report_swap()
     """
 
-    # Expose useragent for watchdog integration
+    # Expose useragent for external use if needed
     USERAGENT = MPV_USERAGENT
 
     def __init__(
             self,
+            tvh: "TVHeadendScanner | None" = None,
             debounce_s: float = 0.150,
             tune_timeout_s: float = 20.0,
             max_retries: int = 2,
             frame_grace_s: float = 0.2,  # ignore early frames (buffered)
     ):
+        self._tvh = tvh
         self._mpv: EmbeddedMPV | None = None
+        self._watchdog: WatchdogWorker | None = None
         self.log = Logger("tuner")
 
         # Timing config
@@ -124,8 +137,8 @@ class Tuner:
 
     def initialize(self, test_source: str | None = "av://lavfi:mandelbrot") -> None:
         """
-        Initialize the video player.
-        
+        Initialize the video player and watchdog.
+
         Call after pygame display is created (needs GL context).
         Optionally loads a test source and pauses.
         """
@@ -136,8 +149,16 @@ class Tuner:
             self._mpv.loadfile(test_source)
             self._mpv.pause()
 
+        # Start watchdog if we have a TVHeadend connection
+        if self._tvh and self._watchdog is None:
+            self._watchdog = WatchdogWorker(self._tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
+            self._watchdog.start()
+
     def shutdown(self) -> None:
-        """Shutdown the video player and release resources."""
+        """Shutdown the video player, watchdog, and release resources."""
+        if self._watchdog:
+            self._watchdog.shutdown()
+            self._watchdog = None
         if self._mpv:
             self._mpv.shutdown()
             self._mpv = None
@@ -170,9 +191,9 @@ class Tuner:
     def render_frame(self, width: int, height: int) -> bool:
         """
         Render a video frame to the current GL context.
-        
+
         Call once per frame in the render loop, before tick().
-        
+
         Returns:
             True if a new frame was rendered, False otherwise.
         """
@@ -195,6 +216,9 @@ class Tuner:
         if self._mpv:
             self._mpv.tick()  # process pending mpv commands
 
+        # Process watchdog actions
+        self._process_watchdog()
+
         # Run state machine
         return self._tick_state(did_render_frame)
 
@@ -210,7 +234,7 @@ class Tuner:
     def request_tune(self, url: str, name: str = "") -> None:
         """
         Request a channel tune with debouncing.
-        
+
         Rapid calls will coalesce - only the last one fires after debounce window.
         """
         self._pending_url = url
@@ -221,7 +245,7 @@ class Tuner:
     def tune_now(self, url: str, name: str = "") -> None:
         """
         Tune immediately without debouncing.
-        
+
         Use for initial tune or watchdog recovery.
         """
         self._pending_url = url
@@ -253,6 +277,26 @@ class Tuner:
     # -------------------------------------------------------------------------
     # Internal
     # -------------------------------------------------------------------------
+
+    def _process_watchdog(self) -> None:
+        """Update watchdog state and process any recovery actions."""
+        if not self._watchdog:
+            return
+
+        # Update watchdog with current state
+        self._watchdog.expecting = self.is_expecting_video
+        self._watchdog.current_url = self._current_url
+        self._watchdog.tuning_started_at = self._tune_started_at
+
+        # Drain and process watchdog actions
+        while True:
+            try:
+                action, url, reason = self._watchdog.actions.get_nowait()
+            except Empty:
+                break
+
+            if action == "reload" and url:
+                self.reload(reason)
 
     def _tick_state(self, did_render_frame: bool) -> TunerStatus:
         """

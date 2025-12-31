@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import os
-import threading
-import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import SimpleQueue, Empty
@@ -15,7 +13,7 @@ from fptv.log import Logger
 from fptv.tuner import Tuner, TunerState
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
-from fptv.tvh import Channel, TVHeadendScanner, ScanConfig, WatchdogWorker
+from fptv.tvh import Channel, TVHeadendScanner, ScanConfig
 
 FPTV_CAPTION = "fptv"
 ASSETS_FONT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets/fonts")
@@ -48,81 +46,21 @@ class State:
             self.channels = []
 
 
-@dataclass
-class TVHStatus:
-    t: float
-    ok: bool
-    subs: dict | None = None
-    conns: dict | None = None
-    err: str | None = None
-
-
-class TVHPoller(threading.Thread):
-    """
-    Poll TVHeadend in a background thread and push latest status into a queue.
-
-    - Never blocks the render thread.
-    - Drops old status if the main thread is behind (keeps only the latest).
-    """
-
-    def __init__(self, tvh, out_queue: SimpleQueue, interval_s: float = 1.0):
-        super().__init__(daemon=True)
-        self.tvh = tvh
-        self.out_queue = out_queue
-        self.interval_s = interval_s
-        self._stop_evt = threading.Event()
-
-    def stop(self) -> None:
-        self._stop_evt.set()
-
-    def run(self) -> None:
-        while not self._stop_evt.is_set():
-            t0 = time.time()
-            try:
-                subs = self.tvh.subscriptions()
-                conns = self.tvh.connections()
-                status = TVHStatus(t=t0, ok=True, subs=subs, conns=conns)
-            except Exception as e:
-                status = TVHStatus(t=t0, ok=False, err=str(e))
-
-            # Push status; SimpleQueue can grow, so optionally drain older items:
-            try:
-                # keep queue small: drop stale statuses
-                while True:
-                    self.out_queue.get_nowait()
-            except Exception:
-                pass
-
-            self.out_queue.put(status)
-
-            # sleep remainder
-            dt = time.time() - t0
-            sleep_for = max(0.05, self.interval_s - dt)
-            self._stop_evt.wait(sleep_for)
-
-    def shutdown(self):
-        self.stop()
-        self.join(timeout=2.0)
-
-
 class FPTV:
     def __init__(self, screen_w: int = SCREEN_W, screen_h: int = SCREEN_H):
         self.w = screen_w
         self.h = screen_h
         self.log = Logger("fptv")
         self.event_queue = SimpleQueue()
-        self.tvh_status_q = SimpleQueue()
         self.tvh = TVHeadendScanner(ScanConfig.from_env())
-        self.poller = TVHPoller(self.tvh, self.tvh_status_q, interval_s=1.0)
         self.hw = HwEventBinding(self.event_queue)
         self.state = State(channels=self.tvh.get_playlist_channels())
-        self.watch: WatchdogWorker | None = None
 
         pygame.init()
         pygame.font.init()
 
         self._init_renderer()
-        self.tuner = Tuner()
+        self.tuner = Tuner(self.tvh)
         self.tuner.initialize()
 
         self.renderer = GLMenuRenderer(self.w, self.h)
@@ -159,11 +97,6 @@ class FPTV:
         mode: Screen = Screen.MENU
         self.overlays.set_channel_name("Channel: None")
         force_flip = False
-
-        self.watch = WatchdogWorker(self.tvh, ua_tag=Tuner.USERAGENT, interval_s=1.0)
-        self.watch.start()
-
-        self.poller.start()
 
         running = True
         clock = pygame.time.Clock()
@@ -254,23 +187,6 @@ class FPTV:
                 self.overlays.tick()
                 self.overlays.draw()
 
-                # --- Watchdog integration ---
-                self.watch.expecting = self.tuner.is_expecting_video
-                self.watch.current_url = self.tuner.current_url
-                self.watch.tuning_started_at = self.tuner.tune_started_at
-
-                # Drain watchdog actions
-                while True:
-                    try:
-                        action, url, reason = self.watch.actions.get_nowait()
-                    except Empty:
-                        break
-
-                    if action == "reload" and url:
-                        self.tuner.reload(reason)
-                        mode = Screen.TUNE
-                        force_flip = True
-
                 # Present
                 if did_render or force_flip:
                     pygame.display.flip()
@@ -291,10 +207,6 @@ class FPTV:
 
     def shutdown(self) -> int:
         try:
-            print("Stopping watchdog worker.")
-            self.watch.shutdown()
-            print("Stopping TVH poller.")
-            self.poller.shutdown()
             print("Releasing GPIOs.")
             self.hw.close()
             print("Shutting down tuner.")
