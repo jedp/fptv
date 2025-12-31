@@ -12,7 +12,6 @@ import pygame
 from fptv.event import Event
 from fptv.hw import HwEventBinding, ENCODER_CHANNEL_NAME, ENCODER_VOLUME_NAME
 from fptv.log import Logger
-from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 from fptv.tuner import Tuner, TunerState
 from fptv.render import GLMenuRenderer, OverlayManager, init_viewport
 from fptv.render import draw_menu_surface, make_text_overlay, make_volume_overlay, clear_screen
@@ -122,10 +121,9 @@ class FPTV:
         pygame.init()
         pygame.font.init()
 
-        self._init_renderer()  # creates GL context + renderer + overlays
-        self.mpv = EmbeddedMPV()
-        self.mpv.initialize()  # now GL proc lookup is valid
-        self.tuner = Tuner(self.mpv)
+        self._init_renderer()
+        self.tuner = Tuner()
+        self.tuner.initialize()
 
         self.renderer = GLMenuRenderer(self.w, self.h)
 
@@ -153,22 +151,16 @@ class FPTV:
         pygame.init()
         pygame.display.set_mode((self.w, self.h), pygame.FULLSCREEN | pygame.OPENGL | pygame.DOUBLEBUF)
 
-        # Startup: pause on test source; user presses to enter video mode.
-        self.mpv.initialize()
-        self.mpv.loadfile("av://lavfi:mandelbrot")
-        self.mpv.pause()
-
         menu_surf = pygame.Surface((SCREEN_W, SCREEN_H))
 
         # Channel list
-        # self.state.fetch_channels(self.tvh)
         self.log.out(f"Loaded {len(self.state.channels)} channels")
 
         mode: Screen = Screen.MENU
         self.overlays.set_channel_name("Channel: None")
         force_flip = False
 
-        self.watch = WatchdogWorker(self.tvh, ua_tag=MPV_USERAGENT, interval_s=1.0)
+        self.watch = WatchdogWorker(self.tvh, ua_tag=Tuner.USERAGENT, interval_s=1.0)
         self.watch.start()
 
         self.poller.start()
@@ -195,7 +187,7 @@ class FPTV:
                 if ev == Event.PRESS:
                     if mode == Screen.MENU:
                         # Start video mode
-                        self.mpv.resume()
+                        self.tuner.resume()
                         if self.state.channels:
                             ch = self.state.channels[self.state.browse_index]
                             self.tuner.tune_now(ch.url, f"Channel: {ch.name}")
@@ -208,7 +200,7 @@ class FPTV:
                         # Return to menu
                         mode = Screen.MENU
                         self.tuner.cancel()
-                        self.mpv.pause()
+                        self.tuner.pause()
                         force_flip = True
 
                 if ev == Event.ROT_L or ev == Event.ROT_R:
@@ -229,7 +221,7 @@ class FPTV:
 
                     elif ev_src == ENCODER_VOLUME_NAME:
                         delta = 5 if ev == Event.ROT_R else -5
-                        self.mpv.add_volume(delta)
+                        self.tuner.add_volume(delta)
 
             # --- Render ---
             init_viewport(self.w, self.h)
@@ -237,11 +229,8 @@ class FPTV:
             if mode in (Screen.PLAY, Screen.TUNE):
                 clear_screen()
 
-                # Render mpv frame
-                did_render = self.mpv.maybe_render(self.w, self.h)
-
-                # Tick tuner state machine
-                tune_status = self.tuner.tick(did_render)
+                # Render video frame and tick tuner state machine
+                tune_status = self.tuner.render_tick(self.w, self.h)
 
                 # Update mode based on tuner state
                 if tune_status.state == TunerState.PLAYING:
@@ -250,7 +239,7 @@ class FPTV:
                     mode = Screen.TUNE
                 elif tune_status.state == TunerState.FAILED:
                     self.overlays.set_channel_name("No signal", seconds=3.0)
-                    self.mpv.pause()
+                    self.tuner.pause()
                     mode = Screen.MENU
                     force_flip = True
 
@@ -282,9 +271,9 @@ class FPTV:
                         force_flip = True
 
                 # Present
-                if did_render or force_flip:
+                if tune_status.did_render or force_flip:
                     pygame.display.flip()
-                    self.mpv.report_swap()
+                    self.tuner.report_swap()
                     force_flip = False
 
             else:
@@ -295,10 +284,7 @@ class FPTV:
                 clear_screen()
                 self.renderer.draw_fullscreen()
                 pygame.display.flip()
-                self.mpv.report_swap()
-
-            # Let mpv process pending commands
-            self.mpv.tick()
+                self.tuner.report_swap()
 
         self.shutdown()
 
@@ -310,8 +296,8 @@ class FPTV:
             self.poller.shutdown()
             print("Releasing GPIOs.")
             self.hw.close()
-            print("Shutting down player.")
-            self.mpv.shutdown()
+            print("Shutting down tuner.")
+            self.tuner.shutdown()
             print("Quitting pygame engine.")
             pygame.quit()
         except Exception as e:

@@ -1,18 +1,22 @@
 """
-Tuner: encapsulates debouncing, tune state machine, timeout/retry logic.
+Tuner: high-level video tuning interface that owns and hides EmbeddedMPV.
+
+Encapsulates:
+- mpv lifecycle (init, render, shutdown)
+- Input debouncing (coalesces rapid channel changes)
+- Tune timeout and retry logic
+- State machine (IDLE → TUNING → PLAYING or FAILED)
 """
 import time
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, TYPE_CHECKING
 
 from fptv.log import Logger
-
-if TYPE_CHECKING:
-    from fptv.mpv import EmbeddedMPV
+from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
 
 
 class TunerState(Enum):
+    """State machine for channel tuning."""
     IDLE = auto()  # Not tuning, no video expected
     TUNING = auto()  # Tune in progress, waiting for frames
     PLAYING = auto()  # Successfully receiving frames
@@ -21,39 +25,51 @@ class TunerState(Enum):
 
 @dataclass
 class TunerStatus:
+    """Snapshot of tuner state for UI display."""
     state: TunerState
     channel_name: str
-    message: Optional[str] = None  # "Retrying…", "No signal", etc.
+    message: str | None = None  # "Retrying…", "No signal", etc.
+    did_render: bool = False  # True if a frame was rendered this tick
 
 
 class Tuner:
     """
-    High-level tuning controller that wraps EmbeddedMPV.
+    High-level video tuning controller that owns the embedded player.
+    
+    The embedded mpv player is an implementation detail.
     
     Handles:
+    - mpv lifecycle (initialize, render, shutdown)
     - Input debouncing (coalesces rapid channel changes)
     - Tune timeout and retry logic
     - State machine (IDLE → TUNING → PLAYING or FAILED)
     
     Usage:
-        tuner = Tuner(mpv)
-        tuner.request_tune(url, "Channel: PBS")  # debounced
+        tuner = Tuner()
+        tuner.initialize()
+        
+        # Enter video mode
+        tuner.resume()
+        tuner.tune_now(url, "Channel: PBS")
         
         # In render loop:
-        status = tuner.tick(did_render_frame)
-        if status.message:
-            overlay.set_text(status.message)
+        status = tuner.render_tick(width, height)
+        if status.did_render:
+            pygame.display.flip()
+            tuner.report_swap()
     """
+
+    # Expose useragent for watchdog integration
+    USERAGENT = MPV_USERAGENT
 
     def __init__(
             self,
-            mpv: "EmbeddedMPV",
             debounce_s: float = 0.150,
             tune_timeout_s: float = 20.0,
             max_retries: int = 2,
             frame_grace_s: float = 0.2,  # ignore early frames (buffered)
     ):
-        self.mpv = mpv
+        self._mpv: EmbeddedMPV | None = None
         self.log = Logger("tuner")
 
         # Timing config
@@ -64,7 +80,7 @@ class Tuner:
 
         # State
         self._state = TunerState.IDLE
-        self._current_url: Optional[str] = None
+        self._current_url: str | None = None
         self._current_name: str = ""
 
         # Pending request (debounced)
@@ -76,6 +92,10 @@ class Tuner:
         self._tune_started_at: float = 0.0
         self._tune_attempts: int = 0
         self._status_message: str | None = None
+
+    # -------------------------------------------------------------------------
+    # Properties
+    # -------------------------------------------------------------------------
 
     @property
     def state(self) -> TunerState:
@@ -97,6 +117,87 @@ class Tuner:
     def is_expecting_video(self) -> bool:
         """True if we're tuning or playing (for watchdog)."""
         return self._state in (TunerState.TUNING, TunerState.PLAYING)
+
+    # -------------------------------------------------------------------------
+    # Lifecycle (wraps mpv)
+    # -------------------------------------------------------------------------
+
+    def initialize(self, test_source: str | None = "av://lavfi:mandelbrot") -> None:
+        """
+        Initialize the video player.
+        
+        Call after pygame display is created (needs GL context).
+        Optionally loads a test source and pauses.
+        """
+        if self._mpv is None:
+            self._mpv = EmbeddedMPV()
+        self._mpv.initialize()
+        if test_source:
+            self._mpv.loadfile(test_source)
+            self._mpv.pause()
+
+    def shutdown(self) -> None:
+        """Shutdown the video player and release resources."""
+        if self._mpv:
+            self._mpv.shutdown()
+            self._mpv = None
+
+    def pause(self) -> None:
+        """Pause video playback (for menu mode)."""
+        if self._mpv:
+            self._mpv.pause()
+
+    def resume(self) -> None:
+        """Resume video playback (entering video mode)."""
+        if self._mpv:
+            self._mpv.resume()
+
+    def add_volume(self, delta: int) -> None:
+        """Adjust volume by delta (positive = louder)."""
+        if self._mpv:
+            self._mpv.add_volume(delta)
+
+    def get_volume(self) -> int:
+        """Get current volume level (0-100)."""
+        if self._mpv:
+            return self._mpv.get_volume()
+        return 0
+
+    # -------------------------------------------------------------------------
+    # Rendering
+    # -------------------------------------------------------------------------
+
+    def render_tick(self, width: int, height: int) -> TunerStatus:
+        """
+        Render a frame and tick the tuner state machine.
+        
+        Call once per frame in the render loop.
+        
+        Returns:
+            TuneStatus with current state, any message, and whether a frame was rendered.
+        """
+        did_render = False
+        if self._mpv:
+            did_render = self._mpv.maybe_render(width, height)
+            self._mpv.tick()  # process pending mpv commands
+
+        # Run state machine
+        status = self._tick_state(did_render)
+        return TunerStatus(
+            state=status.state,
+            channel_name=status.channel_name,
+            message=status.message,
+            did_render=did_render,
+        )
+
+    def report_swap(self) -> None:
+        """Notify mpv that a buffer swap occurred. Call after pygame.display.flip()."""
+        if self._mpv:
+            self._mpv.report_swap()
+
+    # -------------------------------------------------------------------------
+    # Tuning API
+    # -------------------------------------------------------------------------
 
     def request_tune(self, url: str, name: str = "") -> None:
         """
@@ -127,9 +228,27 @@ class Tuner:
         self._state = TunerState.IDLE
         self._status_message = None
 
-    def tick(self, did_render_frame: bool) -> TunerStatus:
+    def reload(self, reason: str = "") -> None:
         """
-        Call every frame. Handles state transitions and returns current status.
+        Reload current URL (for watchdog recovery).
+        """
+        if not self._current_url or not self._mpv:
+            return
+
+        self.log.out(f"Reload: {reason}")
+        self._mpv.stop()
+        self._mpv.loadfile_now(self._current_url)
+        self._tune_started_at = time.time()
+        self._tune_attempts = 0
+        self._state = TunerState.TUNING
+
+    # -------------------------------------------------------------------------
+    # Internal
+    # -------------------------------------------------------------------------
+
+    def _tick_state(self, did_render_frame: bool) -> TunerStatus:
+        """
+        Internal: tick the tune state machine.
         
         Args:
             did_render_frame: True if mpv rendered a new frame this tick
@@ -162,8 +281,8 @@ class Tuner:
                     self._tune_started_at = now
                     self._status_message = "Retrying…"
                     self.log.out(f"Tune timeout; retry {self._tune_attempts}/{self._max_retries}")
-                    if self._current_url:
-                        self.mpv.loadfile_now(self._current_url)
+                    if self._current_url and self._mpv:
+                        self._mpv.loadfile_now(self._current_url)
                 else:
                     self._state = TunerState.FAILED
                     self._status_message = "No signal"
@@ -175,20 +294,6 @@ class Tuner:
             message=self._status_message,
         )
 
-    def reload(self, reason: str = "") -> None:
-        """
-        Reload current URL (for watchdog recovery).
-        """
-        if not self._current_url:
-            return
-
-        self.log.out(f"Reload: {reason}")
-        self.mpv.stop()
-        self.mpv.loadfile_now(self._current_url)
-        self._tune_started_at = time.time()
-        self._tune_attempts = 0
-        self._state = TunerState.TUNING
-
     def _fire_tune(self, url: str, name: str) -> None:
         """Actually start the tune."""
         self._current_url = url
@@ -198,4 +303,5 @@ class Tuner:
         self._state = TunerState.TUNING
 
         self.log.out(f"Tune to: {name}")
-        self.mpv.loadfile_now(url)
+        if self._mpv:
+            self._mpv.loadfile_now(url)
