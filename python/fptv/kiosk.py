@@ -33,6 +33,9 @@ VOLUME_DECREMENT = -5
 # EPG refresh interval (seconds) - fetch "now playing" data periodically on Browse screen
 EPG_REFRESH_SECS = 60.0
 
+# How soon to retry if we have no channels yet
+CHANNEL_RETRY_SECS = 5.0
+
 SCAN_PROMPT = "Press to start scan"
 
 
@@ -143,10 +146,7 @@ class FPTV:
                 self.display.render_main_menu(MENU_OPTIONS, self.state.menu_index)
 
             elif self.state.screen == Screen.BROWSE:
-                # Refresh EPG data periodically
-                if time.time() - self.state.epg_fetched_at > EPG_REFRESH_SECS:
-                    self.state.epg_map = self.tvh.get_epg_now()
-                    self.state.epg_fetched_at = time.time()
+                self._maybe_refresh_browse_data()
 
                 self.display.render_browse(
                     self.state.channels,
@@ -163,6 +163,28 @@ class FPTV:
                 self.display.render_scan(self._scan_status, self.state.scan_index)
 
         self.shutdown()
+
+    def _maybe_refresh_browse_data(self) -> None:
+        """Start a background refresh of Browse's data if it's due."""
+        interval = EPG_REFRESH_SECS if self.state.channels else CHANNEL_RETRY_SECS
+        if time.time() - self.state.epg_fetched_at > interval:
+            self.state.epg_fetched_at = time.time()
+            threading.Thread(target=self._fetch_browse_data, name="fptv-epg", daemon=True).start()
+
+    def _fetch_browse_data(self) -> None:
+        """
+        Runs in its own thread, because these requests can stall for seconds.
+        Channels can be missing if TVHeadend wasn't ready when we started.
+        """
+        try:
+            tvh = TVHeadendScanner(self.tvh.config)
+            if not self.state.channels:
+                self.state.channels = tvh.get_playlist_channels()
+            epg_map = tvh.get_epg_now()
+            if epg_map:
+                self.state.epg_map = epg_map
+        except Exception as e:
+            self.log.err(f"Browse refresh failed: {e}")
 
     def _handle_button_press(self) -> None:
         """Handle button press based on current screen."""
