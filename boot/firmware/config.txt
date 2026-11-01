@@ -13,9 +13,8 @@
 # Note spelling: gpiopin
 dtoverlay=gpio-poweroff,gpiopin=26,active_low=0
 
-# Disable onboard audio; use the MAX98357A I2S amp
-dtparam=audio=off
-dtoverlay=max98357a
+# Enable audio (loads snd_bcm2835). The speaker amp is fed by the headphone jack.
+dtparam=audio=on
 
 # Additional overlays and parameters are documented
 # /boot/firmware/overlays/README
