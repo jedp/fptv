@@ -78,6 +78,7 @@ class Tuner:
             debounce_s: float = 0.150,
             tune_timeout_s: float = 20.0,
             max_retries: int = 2,
+            retry_delay_s: float = 3.0,
     ):
         self._tvh = tvh
         self._mpv: EmbeddedMPV | None = None
@@ -88,6 +89,7 @@ class Tuner:
         self._debounce_s = debounce_s
         self._tune_timeout_s = tune_timeout_s
         self._max_retries = max_retries
+        self._retry_delay_s = retry_delay_s
 
         # State
         self._state = TunerState.IDLE
@@ -102,6 +104,7 @@ class Tuner:
         # Tune tracking
         self._tune_started_at: float = 0.0
         self._tune_attempts: int = 0
+        self._retry_at: float = 0.0  # When to retry, or 0 if none is scheduled
         self._status_message: str | None = None
 
         self._initialize()
@@ -248,6 +251,10 @@ class Tuner:
         self._pending_name = ""
         self._state = TunerState.IDLE
         self._status_message = None
+        self._retry_at = 0.0
+        if self._watchdog:
+            # tick() doesn't run on menu screens, so tell it right away.
+            self._watchdog.update_state(playing=False, current_url=None)
 
     def stop(self) -> None:
         """Go idle and close the stream, which frees the tuner."""
@@ -267,6 +274,7 @@ class Tuner:
         self._mpv.loadfile_now(self._current_url)
         self._tune_started_at = time.time()
         self._tune_attempts = 0
+        self._retry_at = 0.0
         self._state = TunerState.TUNING
 
     # -------------------------------------------------------------------------
@@ -296,14 +304,16 @@ class Tuner:
                 self.reload(reason)
 
     def _retry_or_fail(self, now: float) -> None:
-        """Reopen the stream if we have retries left; otherwise give up."""
+        """
+        Schedule a reopen if we have retries left; otherwise give up. The delay
+        matters: a dead mux can fail instantly, using up retries in a second.
+        """
         if self._tune_attempts < self._max_retries:
             self._tune_attempts += 1
             self._tune_started_at = now
+            self._retry_at = now + self._retry_delay_s
             self._status_message = "Retrying…"
             self.log.out(f"Tune retry {self._tune_attempts}/{self._max_retries}")
-            if self._current_url and self._mpv:
-                self._mpv.loadfile_now(self._current_url)
         else:
             self._state = TunerState.FAILED
             self._status_message = "No signal"
@@ -333,7 +343,13 @@ class Tuner:
         ended = PlaybackEvent.ENDED in events
 
         if self._state == TunerState.TUNING:
-            if ended:
+            if self._retry_at:
+                if now >= self._retry_at:
+                    self._retry_at = 0.0
+                    if self._current_url and self._mpv:
+                        self._mpv.loadfile_now(self._current_url)
+
+            elif ended:
                 self._retry_or_fail(now)
 
             # Success: mpv says playback began. A drawn frame doesn't prove it.
@@ -363,6 +379,7 @@ class Tuner:
         self._current_name = name
         self._tune_started_at = time.time()
         self._tune_attempts = 0
+        self._retry_at = 0.0
         self._state = TunerState.TUNING
 
         self.log.out(f"Tune to: {name}")
