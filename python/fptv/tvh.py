@@ -419,14 +419,14 @@ class TVHeadendScanner:
         return False
 
     def subscriptions(self) -> dict[str, Any]:
-        return self._get_json("status/subscriptions")
+        return self._get_json("/api/status/subscriptions")
 
     def connections(self) -> dict[str, Any]:
-        return self._get_json("status/connections")
+        return self._get_json("/api/status/connections")
 
     def cancel_connections(self, ids: list[int] | str) -> dict[str, Any]:
-        # docs: if id='all' then all connections cancelled :contentReference[oaicite:2]{index=2}
-        return self._get_json("connections/cancel", id=ids)
+        # If id='all', then all connections are cancelled.
+        return self._get_json("/api/connections/cancel", params={"id": ids})
 
     def debug_channel_service_mux_health(self, net_uuid: str) -> dict:
         mux_index = self.get_mux_index(net_uuid=net_uuid)
@@ -1827,23 +1827,31 @@ class TVHeadendScanner:
 @dataclass
 class WatchdogState:
     """Explicit state shared between main thread and watchdog thread."""
-    expecting: bool = False
+    playing: bool = False
     current_url: str | None = None
-    tuning_started_at: float = 0.0
 
 
 class WatchdogWorker:
-    def __init__(self, tvh, *, ua_tag: str, interval_s: float = 1.0):
+    """
+    Reloads a stream that has stopped delivering data while we're playing.
+
+    Reception errors alone never trigger a reload: the stream is still
+    flowing, and reopening it would turn a brief glitch into a retune.
+    Tuning isn't watched either, since the Tuner handles its own retries.
+    """
+
+    def __init__(self, tvh, *, ua_tag: str, interval_s: float = 1.0, stuck_after_s: float = 5.0):
         self._log = Logger("watchdog")
         self.tvh = tvh
         self.ua_tag = ua_tag
         self.interval_s = interval_s
+        self.stuck_after_s = stuck_after_s
         self.actions = SimpleQueue()  # ("reload", url, reason)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="tvh-watchdog", daemon=True)
 
         self._bad_since: float | None = None
-        self._last_fix = 0.0
+        self._seen_errors: tuple[object, int] = (None, 0)  # (subscription id, errors)
 
         # Explicit state updated by main thread via update_state()
         self._state = WatchdogState()
@@ -1859,12 +1867,11 @@ class WatchdogWorker:
 
     def update_state(
             self,
-            expecting: bool,
+            playing: bool,
             current_url: str | None,
-            tuning_started_at: float,
     ) -> None:
         """Update the shared state from the main thread."""
-        self._state = WatchdogState(expecting, current_url, tuning_started_at)
+        self._state = WatchdogState(playing, current_url)
 
     def _find_our_sub(self, subs: dict):
         for e in subs.get("entries", []):
@@ -1875,72 +1882,68 @@ class WatchdogWorker:
                 return e
         return None
 
+    def _log_new_errors(self, sub: dict) -> None:
+        """Log reception errors as they happen. TVH reports a running total."""
+        sub_id = sub.get("id")
+        errors = int(sub.get("errors") or 0)
+        seen_id, seen = self._seen_errors
+        if sub_id == seen_id and errors > seen:
+            self._log.out(f"Stream errors: +{errors - seen} (total {errors})")
+        self._seen_errors = (sub_id, errors)
+
+    def _problem(self, sub: dict | None, now: float) -> str | None:
+        """Returns why the stream looks stuck, or None if data is flowing."""
+        if sub is None:
+            return "missing_subscription"
+
+        state = sub.get("state") or ""
+        rate_in = int(sub.get("in") or 0)
+        rate_out = int(sub.get("out") or 0)
+        started = int(sub.get("start") or 0)
+        age = now - started if started else 0.0
+
+        if state.lower() == "bad":
+            return f"bad_state:{state}"
+        if age > self.stuck_after_s and rate_in == 0 and rate_out == 0:
+            return f"no_data:{state}"
+        return None
+
     def _run(self):
         while not self._stop.is_set():
-            now = time.time()
-            try:
-                subs = self.tvh.subscriptions()
-            except Exception:
-                if self._stop.wait(self.interval_s):
-                    break  # Stop requested during wait
+            ws = self._state  # Set by main thread via update_state()
+
+            if not (ws.playing and ws.current_url):
+                self._bad_since = None
+                self._stop.wait(self.interval_s)
                 continue
 
-            ours = self._find_our_sub(subs)
+            now = time.time()
+            try:
+                sub = self._find_our_sub(self.tvh.subscriptions())
+            except Exception as e:
+                self._log.err(f"Can't read subscriptions: {e}")
+                self._stop.wait(self.interval_s)
+                continue
 
-            # Read explicit state (set by main thread via update_state())
-            ws = self._state
-            expecting = ws.expecting
-            current_url = ws.current_url
-            tuning_started_at = ws.tuning_started_at
+            if sub:
+                self._log_new_errors(sub)
 
-            # grace: immediately after tune, missing subscription can be normal
-            if expecting and (now - tuning_started_at) < 1.0:
-                ours = ours  # do nothing special
+            problem = self._problem(sub, now)
+            if problem is None:
+                if self._bad_since is not None:
+                    self._log.out("Stream health restored")
+                self._bad_since = None
 
-            took_action = False
+            elif self._bad_since is None:
+                self._bad_since = now
+                self._log.out(f"Issue detected: {problem}")
 
-            if expecting and current_url:
-                if not ours:
-                    if self._bad_since is None:
-                        self._bad_since = now
-                        self._log.out("Issue detected: subscription missing")
-                    elif now - self._bad_since > 3.0 and now - self._last_fix > 1.0:
-                        self._last_fix = now
-                        self._bad_since = now
-                        self._log.out("Triggering reload: missing_subscription")
-                        self.actions.put(("reload", current_url, "missing_subscription"))
-                        took_action = True
-                else:
-                    state = (ours.get("state") or "")
-                    errs = int(ours.get("errors") or 0)
-                    rate_in = int(ours.get("in") or 0)
-                    rate_out = int(ours.get("out") or 0)
-                    started = int(ours.get("start") or 0)
-                    age = now - started if started else 0.0
+            elif now - self._bad_since > self.stuck_after_s:
+                self._bad_since = None
+                self._log.out(f"Triggering reload: {problem}")
+                self.actions.put(("reload", ws.current_url, problem))
 
-                    looks_stuck = (
-                            state.lower() == "bad"
-                            or errs > 0
-                            or (age > 3.0 and rate_in == 0 and rate_out == 0)
-                    )
-
-                    if not looks_stuck:
-                        if self._bad_since is not None:
-                            self._log.out("Stream health restored")
-                        self._bad_since = None
-                    else:
-                        if self._bad_since is None:
-                            self._bad_since = now
-                            self._log.out(f"Issue detected: {state=} {errs=} in={rate_in} out={rate_out}")
-                        elif now - self._bad_since > 2.0 and now - self._last_fix > 1.0:
-                            self._last_fix = now
-                            self._bad_since = now
-                            reason = f"stuck:{state}:{errs}:{rate_in}/{rate_out}"
-                            self._log.out(f"Triggering reload: {reason}")
-                            self.actions.put(("reload", current_url, reason))
-                            took_action = True
-
-            self._stop.wait(self.interval_s if not took_action else 0.1)
+            self._stop.wait(self.interval_s)
 
 
 def main():

@@ -126,11 +126,6 @@ class Tuner:
     def tune_started_at(self) -> float:
         return self._tune_started_at
 
-    @property
-    def is_expecting_video(self) -> bool:
-        """True if we're tuning or playing (for watchdog)."""
-        return self._state in (TunerState.TUNING, TunerState.PLAYING)
-
     # -------------------------------------------------------------------------
     # Lifecycle (wraps mpv)
     # -------------------------------------------------------------------------
@@ -275,9 +270,8 @@ class Tuner:
 
         # Update watchdog with current state
         self._watchdog.update_state(
-            expecting=self.is_expecting_video,
+            playing=self._state == TunerState.PLAYING,
             current_url=self._current_url,
-            tuning_started_at=self._tune_started_at,
         )
 
         # Drain and process watchdog actions
@@ -287,7 +281,8 @@ class Tuner:
             except Empty:
                 break
 
-            if action == "reload" and url:
+            # Ignore a reload that was queued before the user changed channels.
+            if action == "reload" and url == self._current_url and self._state == TunerState.PLAYING:
                 self.reload(reason)
 
     def _retry_or_fail(self, now: float) -> None:
