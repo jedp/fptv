@@ -98,11 +98,11 @@ class FPTV:
                     self._handle_wheel(delta)
                     force_flip = True
 
-                elif action == Action.VOLUME_UP:
-                    self.tuner.add_volume(VOLUME_INCREMENT)
-
-                elif action == Action.VOLUME_DOWN:
-                    self.tuner.add_volume(VOLUME_DECREMENT)
+                elif action in (Action.VOLUME_UP, Action.VOLUME_DOWN):
+                    delta = VOLUME_INCREMENT if action == Action.VOLUME_UP else VOLUME_DECREMENT
+                    self.tuner.add_volume(delta)
+                    self.display.show_volume(self.tuner.get_volume())
+                    force_flip = True
 
             # --- Render ---
             if self.state.screen in (Screen.PLAY, Screen.TUNE):

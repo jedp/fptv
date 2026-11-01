@@ -175,18 +175,21 @@ class Tuner:
     # Rendering
     # -------------------------------------------------------------------------
 
-    def render_frame(self, width: int, height: int) -> bool:
+    def render_frame(self, width: int, height: int, force: bool = False) -> bool:
         """
         Render a video frame to the current GL context.
 
         Call once per frame in the render loop, before tick().
+
+        Args:
+            force: Redraw the current frame even if there's no new one
 
         Returns:
             True if a new frame was rendered, False otherwise.
         """
         if not self._mpv:
             return False
-        return self._mpv.maybe_render(width, height)
+        return self._mpv.maybe_render(width, height, force)
 
     def tick(self) -> TunerStatus:
         """

@@ -79,6 +79,7 @@ class Display:
         self._overlays = OverlayManager(
             screen_w=self.w, screen_h=self.h,
             font=self._font_item,
+            volume_font=self._font_small,
             make_text=make_text_overlay,
             make_volume=make_volume_overlay,
         )
@@ -112,7 +113,8 @@ class Display:
         clear_screen()
 
         # Render video frame
-        did_render = self._tuner.render_frame(self.w, self.h)
+        # Forcing redraws the last frame, so that flipping doesn't show black.
+        did_render = self._tuner.render_frame(self.w, self.h, force=force_flip)
 
         # Tick and draw overlays
         self._overlays.tick()
@@ -126,6 +128,15 @@ class Display:
 
         return False, did_render
 
+    def _present_menu(self) -> None:
+        """Draw the menu surface and any overlays, and flip."""
+        clear_screen()
+        self._renderer.draw_fullscreen()
+        self._overlays.tick()
+        self._overlays.draw()
+        pygame.display.flip()
+        self._tuner.report_swap()
+
     def render_main_menu(self, items: list[str], selected: int) -> None:
         """Render main menu screen with selectable options."""
         init_viewport(self.w, self.h)
@@ -133,10 +144,7 @@ class Display:
         draw_main_menu(self._menu_surface, self._font_title, self._font_item, items, selected)
         self._renderer.update_from_surface(self._menu_surface)
 
-        clear_screen()
-        self._renderer.draw_fullscreen()
-        pygame.display.flip()
-        self._tuner.report_swap()
+        self._present_menu()
 
     def render_browse(self, channels: list, selected: int, epg_map: dict = None) -> None:
         """Render channel browser screen with optional EPG (now playing) info."""
@@ -145,10 +153,7 @@ class Display:
         draw_browse(self._menu_surface, self._font_item, channels, selected, epg_map, self._font_small)
         self._renderer.update_from_surface(self._menu_surface)
 
-        clear_screen()
-        self._renderer.draw_fullscreen()
-        pygame.display.flip()
-        self._tuner.report_swap()
+        self._present_menu()
 
     def render_about(self, info: dict[str, str], selected: int = 0) -> None:
         """Render about screen with device info. selected=-1 means Back."""
@@ -158,10 +163,7 @@ class Display:
                    back_selected=(selected == -1))
         self._renderer.update_from_surface(self._menu_surface)
 
-        clear_screen()
-        self._renderer.draw_fullscreen()
-        pygame.display.flip()
-        self._tuner.report_swap()
+        self._present_menu()
 
     def render_scan(self, status: str = "Not implemented yet", selected: int = 0) -> None:
         """Render scan screen (placeholder). selected=-1 means Back."""
@@ -171,10 +173,7 @@ class Display:
                   back_selected=(selected == -1))
         self._renderer.update_from_surface(self._menu_surface)
 
-        clear_screen()
-        self._renderer.draw_fullscreen()
-        pygame.display.flip()
-        self._tuner.report_swap()
+        self._present_menu()
 
     # -------------------------------------------------------------------------
     # Overlays

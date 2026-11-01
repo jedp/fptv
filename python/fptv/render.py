@@ -209,7 +209,7 @@ def make_volume_overlay(font: pygame.font.Font, vol: int) -> pygame.Surface:
     pygame.draw.rect(surf, (0, 0, 0, 160), surf.get_rect(), border_radius=16)
 
     label = font.render(f"Vol {vol:3d}%", True, (255, 255, 255))
-    surf.blit(label, (pad, 10))
+    surf.blit(label, (pad, 2))
 
     bar_x, bar_y = pad, 42
     bar_w, bar_h = w - pad * 2, 16
@@ -382,12 +382,14 @@ class OverlayManager:
             screen_w: int,
             screen_h: int,
             font: pygame.font.Font,
+            volume_font: pygame.font.Font,
             make_text: Callable[[pygame.font.Font, str], pygame.Surface],
             make_volume: Callable[[pygame.font.Font, int], pygame.Surface],
     ) -> None:
         self.w = screen_w
         self.h = screen_h
         self.font = font
+        self.volume_font = volume_font
         self._make_text = make_text
         self._make_volume = make_volume
         self._dirty = False
@@ -444,7 +446,7 @@ class OverlayManager:
         vol = int(max(0, min(100, vol)))
         key = ("volume", vol)
         if key != self.volume.content_key:
-            surf = self._get_surface_cached(key, lambda: self._make_volume(self.font, vol))
+            surf = self._get_surface_cached(key, lambda: self._make_volume(self.volume_font, vol))
             self.volume.quad.update_from_surface(surf)
             self.volume.content_key = key
 

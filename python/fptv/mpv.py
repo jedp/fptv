@@ -301,6 +301,9 @@ class EmbeddedMPV:
         self._set_opt("hwdec", "no")
         self._set_opt("vd-lavc-dr", "no")
 
+        # The volume HUD shows 0-100. mpv would otherwise go up to 130.
+        self._set_opt("volume-max", "100")
+
         # YouTube: depends on build/config; harmless if unused.
         self._set_opt("ytdl", "no")
 
