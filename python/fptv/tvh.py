@@ -59,7 +59,6 @@ def json_dumps(obj: object) -> str:
 
 # Scan settle delays - TVHeadend needs time to process changes before next step
 SETTLE_AFTER_SCAN_SECS = 2.0  # After mux scans complete
-SETTLE_AFTER_DISABLE_SECS = 0.5  # After disabling failed muxes
 SETTLE_AFTER_MAPPING_SECS = 1.0  # After service-to-channel mapping
 SETTLE_AFTER_PRUNE_SECS = 1.0  # After pruning/cleanup to avoid retune flakiness
 
@@ -482,46 +481,6 @@ class TVHeadendScanner:
         mux_index = self.get_mux_index(net_uuid=net_uuid)
         return {m for (m, info) in mux_index.items() if self._mux_is_ok(info)}
 
-    def disable_failed_muxes(self, net_uuid: str) -> dict:
-        """
-        Disable muxes that are enabled but scan_result=FAIL.
-        Keeps them around (so you can re-enable later), but stops TVH from retuning to garbage.
-        """
-        resp = self._get("/api/mpegts/mux/grid?limit=99999")
-        data = resp.json()
-
-        disabled = 0
-        considered = 0
-        errors = 0
-
-        for e in data.get("entries", []):
-            # Be robust across builds: sometimes `network_uuid`, sometimes `network` name
-            net = e.get("network_uuid") or e.get("network")
-            if net != net_uuid and net != self.config.net_name:
-                continue
-
-            mux_uuid = e.get("uuid")
-            if not isinstance(mux_uuid, str) or not mux_uuid:
-                continue
-
-            enabled = bool(e.get("enabled", True))
-            scan_result = e.get("scan_result")
-
-            considered += 1
-
-            # Your build: 1=OK, 2=FAIL
-            is_fail = (scan_result == 2) or (isinstance(scan_result, str) and scan_result.upper() == "FAIL")
-            if enabled and is_fail:
-                ent = self._idnode_load_entry(mux_uuid)
-                cls = ent.get("class") if ent else None
-                ok = self._maybe_save_idnode_params(mux_uuid, cls, {"enabled": False})
-                if ok:
-                    disabled += 1
-                else:
-                    errors += 1
-
-        return {"considered": considered, "disabled": disabled, "errors": errors}
-
     def ensure_atsc_t_frontends_enabled_and_linked(self, net_uuid: str) -> dict:
         """
         Enable all ATSC-T frontends and ensure they're assigned to the given network UUID.
@@ -863,17 +822,8 @@ class TVHeadendScanner:
         if not mux.get("enabled", True):
             return False, "removed_mux_disabled"
 
-        r = mux.get("scan_result")
-        # Your build: 1=OK, 2=FAIL, 0=NONE
-        if isinstance(r, int):
-            if r != 1:
-                return False, "removed_mux_bad_scan"
-        elif isinstance(r, str):
-            if r.upper() != "OK":
-                return False, "removed_mux_bad_scan"
-        else:
-            return False, "removed_mux_bad_scan"
-
+        # Don't judge by scan_result. Reception here comes and goes, and a mux
+        # that fails one scan may work fine later, so keep its channels.
         return True, "ok"
 
     def build_mux_conf_from_defaults(self, mux_class: dict) -> dict:
@@ -1543,7 +1493,6 @@ class TVHeadendScanner:
                 "removed_unknown_mux": 0,
                 "removed_wrong_network": 0,
                 "removed_mux_disabled": 0,
-                "removed_mux_bad_scan": 0,
                 "removed_service_missing_mux": 0,
                 "removed_service_uuid_invalid": 0,
             },
@@ -1668,9 +1617,12 @@ class TVHeadendScanner:
         """Step 3: Create ATSC muxes for RF channel range."""
         log(f"Creating ATSC muxes RF {self.config.rf_start}..{self.config.rf_end} (modulation={self.config.modulation})...")
         created_count = 0
+        existing = {info.get("frequency") for info in self.get_mux_index(net_uuid=net_uuid).values()}
         for rf in range(self.config.rf_start, self.config.rf_end + 1):
             try:
                 freq = self.rf_to_freq_hz(rf)
+                if freq in existing:
+                    continue
                 log(f"  RF {rf} -> {freq} Hz")
                 if self.create_mux_atsc(net_uuid, freq):
                     created_count += 1
@@ -1742,12 +1694,6 @@ class TVHeadendScanner:
         log("Deleting orphan channels...")
         deleted = self.delete_orphan_channels()
         log(f"Deleted {deleted} orphan channels.")
-
-        # Disable failed muxes
-        log("Disabling failed muxes")
-        self.disable_failed_muxes(net_uuid)
-        log("Sleeping to let service graph settle...")
-        time.sleep(SETTLE_AFTER_DISABLE_SECS)
 
         # Map services to channels
         log("Mapping services -> channels (deterministic)...")

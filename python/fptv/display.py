@@ -165,8 +165,8 @@ class Display:
 
         self._present_menu()
 
-    def render_scan(self, status: str = "Not implemented yet", selected: int = 0) -> None:
-        """Render scan screen (placeholder). selected=-1 means Back."""
+    def render_scan(self, status: str, selected: int = 0) -> None:
+        """Render scan screen. selected=-1 means Back."""
         init_viewport(self.w, self.h)
 
         draw_scan(self._menu_surface, self._font_title, self._font_item, status,

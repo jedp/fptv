@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -11,7 +12,7 @@ from fptv.hw import HwEventBinding
 from fptv.input import Action, InputMapper
 from fptv.log import Logger
 from fptv.tuner import Tuner, TunerState
-from fptv.tvh import Channel, EPGEvent, TVHeadendScanner, ScanConfig
+from fptv.tvh import Channel, EPGEvent, MuxStates, TVHeadendScanner, ScanConfig
 
 
 class Screen(Enum):
@@ -19,7 +20,7 @@ class Screen(Enum):
     BROWSE = auto()  # Channel list
     TUNE = auto()  # Tuning in progress
     PLAY = auto()  # Video playing
-    SCAN = auto()  # Frequency scan (future)
+    SCAN = auto()  # Frequency scan
     ABOUT = auto()  # About screen
 
 
@@ -31,6 +32,8 @@ VOLUME_DECREMENT = -5
 
 # EPG refresh interval (seconds) - fetch "now playing" data periodically on Browse screen
 EPG_REFRESH_SECS = 60.0
+
+SCAN_PROMPT = "Press to start scan"
 
 
 @dataclass
@@ -73,6 +76,11 @@ class FPTV:
         # Tuner (owns mpv + watchdog) - must construct after Display for GL context
         self.tuner = Tuner(self.tvh)
         self.display.set_tuner(self.tuner)
+
+        # Channel scan, which runs in its own thread
+        self._scan_thread: threading.Thread | None = None
+        self._scan_ok = False
+        self._scan_status = SCAN_PROMPT
 
     def mainloop(self) -> None:
         self.log.out(f"Loaded {len(self.state.channels)} channels")
@@ -150,7 +158,9 @@ class FPTV:
                 self.display.render_about(self._get_about_info(), self.state.about_index)
 
             elif self.state.screen == Screen.SCAN:
-                self.display.render_scan("Not implemented yet", self.state.scan_index)
+                if self._scan_thread and not self._scan_thread.is_alive():
+                    self._finish_scan()
+                self.display.render_scan(self._scan_status, self.state.scan_index)
 
         self.shutdown()
 
@@ -199,6 +209,43 @@ class FPTV:
                 # Back button selected
                 self.state.screen = Screen.MENU
                 self.state.scan_index = 0  # Reset for next time
+            elif not self._scan_thread:
+                self._start_scan()
+
+    def _start_scan(self) -> None:
+        """Start a channel scan. It needs the tuners, so stop any stream first."""
+        self.tuner.stop()
+        self._scan_ok = False
+        self._scan_status = "Scanning..."
+        self._scan_thread = threading.Thread(target=self._run_scan, name="fptv-scan", daemon=True)
+        self._scan_thread.start()
+
+    def _run_scan(self) -> None:
+        """Runs in the scan thread. Uses its own scanner, to not share a session."""
+
+        def progress(_msg: str, states: MuxStates) -> None:
+            if states.total:
+                done = states.total - states.pending - states.active
+                self._scan_status = f"Scanning: {done}/{states.total}"
+
+        try:
+            self._scan_ok = TVHeadendScanner(self.tvh.config).scan(progress)
+        except Exception as e:
+            self.log.err(f"Scan failed: {e}")
+
+    def _finish_scan(self) -> None:
+        """Pick up the results once the scan thread has finished."""
+        self._scan_thread = None
+        channels = self.tvh.get_playlist_channels()
+        if channels:
+            self.state.channels = channels
+            self.state.browse_index = 0
+            self.state.epg_fetched_at = 0.0
+
+        if self._scan_ok:
+            self._scan_status = f"Found {len(channels)} channels"
+        else:
+            self._scan_status = "Scan failed"
 
     def _handle_wheel(self, delta: int) -> None:
         """Handle wheel rotation based on current screen."""
@@ -233,7 +280,7 @@ class FPTV:
             i = self.state.about_index + delta
             self.state.about_index = max(-1, min(0, i))
 
-        elif screen == Screen.SCAN:
+        elif screen == Screen.SCAN and not self._scan_thread:
             # Scroll up to Back (-1), down to content (0)
             i = self.state.scan_index + delta
             self.state.scan_index = max(-1, min(0, i))

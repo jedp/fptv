@@ -703,10 +703,10 @@ def draw_scan(
         surface: pygame.Surface,
         title_font: pygame.font.Font,
         item_font: pygame.font.Font,
-        status: str = "Not implemented yet",
+        status: str,
         back_selected: bool = False,
 ) -> None:
-    """Draw the scan screen (placeholder for now)."""
+    """Draw the scan screen."""
     surface.fill(BG_NORM)
 
     # Header with Back and title

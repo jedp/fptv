@@ -249,6 +249,13 @@ class Tuner:
         self._state = TunerState.IDLE
         self._status_message = None
 
+    def stop(self) -> None:
+        """Go idle and close the stream, which frees the tuner."""
+        self.cancel()
+        self._current_url = None
+        if self._mpv:
+            self._mpv.stop()
+
     def reload(self, reason: str = "") -> None:
         """
         Reload current URL (for watchdog recovery).
