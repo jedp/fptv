@@ -1332,7 +1332,7 @@ class TVHeadendScanner:
         params = {"profile": "pass"}
 
         try:
-            with requests.get(url, params=params, auth=self.auth, stream=True, timeout=seconds) as r:
+            with self._session.get(url, params=params, stream=True, timeout=seconds) as r:
                 if r.status_code != 200:
                     return False
                 # Pull a small chunk; black channel usually still returns TS,

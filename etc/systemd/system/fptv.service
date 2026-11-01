@@ -6,7 +6,8 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=jed
+User=fptv
+Group=fptv
 SyslogIdentifier=fptv
 WorkingDirectory=/opt/fptv/python
 

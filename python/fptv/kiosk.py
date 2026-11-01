@@ -132,7 +132,7 @@ class FPTV:
                     self.state.screen = Screen.TUNE
                 elif tune_status.state == TunerState.FAILED:
                     self.display.show_channel_name("No signal", seconds=3.0)
-                    self.tuner.pause()
+                    self.tuner.stop()
                     self.state.screen = Screen.BROWSE
                     force_flip = True
 
@@ -209,15 +209,13 @@ class FPTV:
                 # Play selected channel
                 ch = self.state.current_channel
                 if ch:
-                    self.tuner.resume()
                     self.tuner.tune_now(ch.url, ch.name)
                     self.display.show_channel_name(ch.name, seconds=3.0)
                     self.state.screen = Screen.TUNE
 
         elif screen in (Screen.PLAY, Screen.TUNE):
-            # Return to browse (at current channel position)
-            self.tuner.cancel()
-            self.tuner.pause()
+            # Return to browse (at current channel position), freeing the tuner
+            self.tuner.stop()
             self.state.screen = Screen.BROWSE
 
         elif screen == Screen.ABOUT:

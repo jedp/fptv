@@ -202,7 +202,7 @@ class EmbeddedMPV:
         # tune these
         self._debounce_s = MPV_DEBOUNCE_PLAY_S
         self._min_switch_gap_s = MPV_MIN_SWITCH_GAP_S
-        self._stop_settle_s = MPV_DEBOUNCE_PLAY_S
+        self._stop_settle_s = MPV_STOP_SETTLE_s
 
         self._bind_functions()
 
@@ -313,6 +313,10 @@ class EmbeddedMPV:
         self._set_opt("opengl-es", "yes")
         self._set_opt("hwdec", "no")
         self._set_opt("vd-lavc-dr", "no")
+
+        # Live TV never seeks, and the default buffers are large for a Pi.
+        self._set_opt("demuxer-max-bytes", "32MiB")
+        self._set_opt("demuxer-max-back-bytes", "0")
 
         # The volume HUD shows 0-100. mpv would otherwise go up to 130.
         self._set_opt("volume-max", "100")
