@@ -49,6 +49,7 @@ class Display:
     def __init__(self, fullscreen: bool = True):
         self._tuner: Tuner | None = None
         self._log = Logger("display")
+        self._menu_key: tuple | None = None  # What the menu last drew
 
         self._initialize(fullscreen)
 
@@ -110,6 +111,7 @@ class Display:
             - did_flip: True if pygame.display.flip() was called
             - did_render_frame: True if mpv rendered a new video frame
         """
+        self._menu_key = None
         init_viewport(self.w, self.h)
         clear_screen()
 
@@ -129,17 +131,31 @@ class Display:
 
         return False, did_render
 
+    def _menu_changed(self, key: tuple) -> bool:
+        """
+        True if the screen needs redrawing. Uploading a full-screen texture
+        is expensive, so menus only draw when their content or overlays change.
+        """
+        self._overlays.tick()
+        overlays_changed = self._overlays.consume_dirty()
+        if key == self._menu_key and not overlays_changed:
+            return False
+        self._menu_key = key
+        return True
+
     def _present_menu(self) -> None:
         """Draw the menu surface and any overlays, and flip."""
         clear_screen()
         self._renderer.draw_fullscreen()
-        self._overlays.tick()
         self._overlays.draw()
         pygame.display.flip()
         self._tuner.report_swap()
 
     def render_main_menu(self, items: list[str], selected: int) -> None:
         """Render main menu screen with selectable options."""
+        if not self._menu_changed(("main", tuple(items), selected)):
+            return
+
         init_viewport(self.w, self.h)
 
         draw_main_menu(self._menu_surface, self._font_title, self._font_item, items, selected)
@@ -149,6 +165,9 @@ class Display:
 
     def render_browse(self, channels: list, selected: int, epg_map: dict = None) -> None:
         """Render channel browser screen with optional EPG (now playing) info."""
+        if not self._menu_changed(("browse", id(channels), selected, id(epg_map))):
+            return
+
         init_viewport(self.w, self.h)
 
         draw_browse(self._menu_surface, self._font_item, channels, selected, epg_map, self._font_small)
@@ -158,6 +177,9 @@ class Display:
 
     def render_about(self, info: dict[str, str], selected: int = 0) -> None:
         """Render about screen with device info. selected=-1 means Back."""
+        if not self._menu_changed(("about", tuple(info.items()), selected)):
+            return
+
         init_viewport(self.w, self.h)
 
         draw_about(self._menu_surface, self._font_title, self._font_item, info,
@@ -168,6 +190,9 @@ class Display:
 
     def render_scan(self, status: str, selected: int = 0) -> None:
         """Render scan screen. selected=-1 means Back."""
+        if not self._menu_changed(("scan", status, selected)):
+            return
+
         init_viewport(self.w, self.h)
 
         draw_scan(self._menu_surface, self._font_title, self._font_item, status,
