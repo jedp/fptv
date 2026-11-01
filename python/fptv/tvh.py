@@ -63,6 +63,8 @@ SETTLE_AFTER_MAPPING_SECS = 1.0  # After service-to-channel mapping
 SETTLE_AFTER_PRUNE_SECS = 1.0  # After pruning/cleanup to avoid retune flakiness
 
 
+ERROR_LOG_INTERVAL_S = 60.0  # Bad reception produces hundreds of errors per second
+
 @dataclass(frozen=True)
 class Channel:
     name: str
@@ -1798,6 +1800,7 @@ class WatchdogWorker:
 
         self._bad_since: float | None = None
         self._seen_errors: tuple[object, int] = (None, 0)  # (subscription id, errors)
+        self._errors_logged_at = 0.0
 
         # Explicit state updated by main thread via update_state()
         self._state = WatchdogState()
@@ -1829,13 +1832,19 @@ class WatchdogWorker:
         return None
 
     def _log_new_errors(self, sub: dict) -> None:
-        """Log reception errors as they happen. TVH reports a running total."""
+        """Periodically log reception errors. TVH reports a running total."""
         sub_id = sub.get("id")
         errors = int(sub.get("errors") or 0)
         seen_id, seen = self._seen_errors
-        if sub_id == seen_id and errors > seen:
+        if sub_id != seen_id:
+            self._seen_errors = (sub_id, 0)
+            seen = 0
+
+        now = time.monotonic()
+        if errors > seen and now - self._errors_logged_at >= ERROR_LOG_INTERVAL_S:
             self._log.out(f"Stream errors: +{errors - seen} (total {errors})")
-        self._seen_errors = (sub_id, errors)
+            self._seen_errors = (sub_id, errors)
+            self._errors_logged_at = now
 
     def _problem(self, sub: dict | None, now: float) -> str | None:
         """Returns why the stream looks stuck, or None if data is flowing."""

@@ -1,4 +1,6 @@
 import ctypes
+import os
+import tempfile
 import threading
 import time
 from ctypes import (
@@ -133,6 +135,17 @@ def _try_load_cdll(names: list[str]) -> ctypes.CDLL | None:
         except OSError:
             pass
     return None
+
+
+def _prepare_log_file() -> str:
+    """Pick a log path that survives reboots, keeping the last run's log."""
+    log_dir = os.getenv("XDG_STATE_HOME", tempfile.gettempdir())
+    path = os.path.join(log_dir, "mpv.log")
+    try:
+        os.replace(path, path + ".prev")
+    except OSError:
+        pass  # Normal on first run
+    return path
 
 
 class EmbeddedMPV:
@@ -283,7 +296,7 @@ class EmbeddedMPV:
         self._set_opt("osd-level", "0")
 
         # Configure log level and logfile.
-        self._set_opt("log-file", "/tmp/mpv.log")
+        self._set_opt("log-file", _prepare_log_file())
         self._set_opt("msg-level", "all=warn")
         # self._set_opt("msg-level", "all=no")
 

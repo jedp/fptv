@@ -54,7 +54,8 @@ class Display:
 
     def _initialize(self, fullscreen: bool) -> None:
         """Initialize pygame display, fonts, and renderers."""
-        pygame.init()
+        # Not pygame.init(), which would open the audio device and lock mpv out.
+        pygame.display.init()
         pygame.font.init()
 
         if fullscreen:
