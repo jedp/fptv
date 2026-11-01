@@ -47,7 +47,9 @@ _press_t0 = 0
 
 
 def _setup_encoder(name: str, gpios: RotaryEncoderGPIOs, q: SimpleQueue) -> Tuple[RotaryEncoder, Button]:
-    enc = RotaryEncoder(gpios.gpio_rot_a, gpios.gpio_rot_b, bounce_time=0.002)
+    # max_steps=0 lets steps count without limit. The default of 16 saturates,
+    # after which on_rotated sees no change and the knob appears to stop.
+    enc = RotaryEncoder(gpios.gpio_rot_a, gpios.gpio_rot_b, bounce_time=0.002, max_steps=0)
     if gpios.gpio_button is None:
         btn = EmptyButton()
     else:
