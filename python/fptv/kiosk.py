@@ -107,12 +107,12 @@ class FPTV:
             # --- Render ---
             if self.state.screen in (Screen.PLAY, Screen.TUNE):
                 # Render video + overlays
-                did_flip, did_render = self.display.render_video(force_flip)
+                did_flip, _ = self.display.render_video(force_flip)
                 if did_flip:
                     force_flip = False
 
                 # Tick tuner state machine
-                tune_status = self.tuner.tick(did_render)
+                tune_status = self.tuner.tick()
 
                 # Update screen based on tuner state
                 if tune_status.state == TunerState.PLAYING:

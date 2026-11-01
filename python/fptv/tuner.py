@@ -15,7 +15,7 @@ from queue import Empty
 from typing import TYPE_CHECKING
 
 from fptv.log import Logger
-from fptv.mpv import EmbeddedMPV, MPV_USERAGENT
+from fptv.mpv import EmbeddedMPV, MPV_USERAGENT, PlaybackEvent
 from fptv.tvh import WatchdogWorker, TVHeadendScanner
 
 if TYPE_CHECKING:
@@ -63,7 +63,7 @@ class Tuner:
 
         # In render loop:
         did_render = tuner.render_frame(width, height)
-        status = tuner.tick(did_render)
+        status = tuner.tick()
         if did_render:
             pygame.display.flip()
             tuner.report_swap()
@@ -78,8 +78,6 @@ class Tuner:
             debounce_s: float = 0.150,
             tune_timeout_s: float = 20.0,
             max_retries: int = 2,
-            frame_grace_s: float = 0.2,  # ignore early frames (buffered)
-            test_source: str | None = "av://lavfi:mandelbrot",
     ):
         self._tvh = tvh
         self._mpv: EmbeddedMPV | None = None
@@ -90,7 +88,6 @@ class Tuner:
         self._debounce_s = debounce_s
         self._tune_timeout_s = tune_timeout_s
         self._max_retries = max_retries
-        self._frame_grace_s = frame_grace_s
 
         # State
         self._state = TunerState.IDLE
@@ -107,7 +104,7 @@ class Tuner:
         self._tune_attempts: int = 0
         self._status_message: str | None = None
 
-        self._initialize(test_source)
+        self._initialize()
 
     # -------------------------------------------------------------------------
     # Properties
@@ -138,14 +135,11 @@ class Tuner:
     # Lifecycle (wraps mpv)
     # -------------------------------------------------------------------------
 
-    def _initialize(self, test_source: str | None) -> None:
+    def _initialize(self) -> None:
         """Initialize the video player and watchdog."""
         if self._mpv is None:
             self._mpv = EmbeddedMPV()
         self._mpv.initialize()
-        if test_source:
-            self._mpv.loadfile(test_source)
-            self._mpv.pause()
 
         # Start watchdog if we have a TVHeadend connection
         if self._tvh and self._watchdog is None:
@@ -199,26 +193,25 @@ class Tuner:
             return False
         return self._mpv.maybe_render(width, height)
 
-    def tick(self, did_render_frame: bool = False) -> TunerStatus:
+    def tick(self) -> TunerStatus:
         """
         Tick the tuner state machine and process pending commands.
 
         Call once per frame, after render_frame().
 
-        Args:
-            did_render_frame: True if render_frame() returned True this tick
-
         Returns:
             TunerStatus with current state and any message for display.
         """
+        events: list[PlaybackEvent] = []
         if self._mpv:
             self._mpv.tick()  # process pending mpv commands
+            events = self._mpv.poll_events()
 
         # Process watchdog actions
         self._process_watchdog()
 
         # Run state machine
-        return self._tick_state(did_render_frame)
+        return self._tick_state(events)
 
     def report_swap(self) -> None:
         """Notify mpv that a buffer swap occurred. Call after pygame.display.flip()."""
@@ -266,7 +259,6 @@ class Tuner:
             return
 
         self.log.out(f"Reload: {reason}")
-        self._mpv.stop()
         self._mpv.loadfile_now(self._current_url)
         self._tune_started_at = time.time()
         self._tune_attempts = 0
@@ -298,12 +290,26 @@ class Tuner:
             if action == "reload" and url:
                 self.reload(reason)
 
-    def _tick_state(self, did_render_frame: bool) -> TunerStatus:
+    def _retry_or_fail(self, now: float) -> None:
+        """Reopen the stream if we have retries left; otherwise give up."""
+        if self._tune_attempts < self._max_retries:
+            self._tune_attempts += 1
+            self._tune_started_at = now
+            self._status_message = "Retrying…"
+            self.log.out(f"Tune retry {self._tune_attempts}/{self._max_retries}")
+            if self._current_url and self._mpv:
+                self._mpv.loadfile_now(self._current_url)
+        else:
+            self._state = TunerState.FAILED
+            self._status_message = "No signal"
+            self.log.out("Tune failed; max retries exceeded")
+
+    def _tick_state(self, events: list[PlaybackEvent]) -> TunerStatus:
         """
         Internal: tick the tune state machine.
 
         Args:
-            did_render_frame: True if mpv rendered a new frame this tick
+            events: What mpv reported about the current file since the last tick
 
         Returns:
             TuneStatus with current state and any message for overlay display
@@ -318,27 +324,27 @@ class Tuner:
             self._pending_name = ""
 
         # --- State machine transitions ---
-        if self._state == TunerState.TUNING:
-            time_since_tune = now - self._tune_started_at
+        started = PlaybackEvent.STARTED in events
+        ended = PlaybackEvent.ENDED in events
 
-            # Success: got a frame after grace period
-            if did_render_frame and time_since_tune > self._frame_grace_s:
+        if self._state == TunerState.TUNING:
+            if ended:
+                self._retry_or_fail(now)
+
+            # Success: mpv says playback began. A drawn frame doesn't prove it.
+            elif started:
                 self._state = TunerState.PLAYING
+                self._tune_attempts = 0
                 self.log.out(f"Tune success: {self._current_name}")
 
-            # Timeout: retry or fail
-            elif time_since_tune > self._tune_timeout_s:
-                if self._tune_attempts < self._max_retries:
-                    self._tune_attempts += 1
-                    self._tune_started_at = now
-                    self._status_message = "Retrying…"
-                    self.log.out(f"Tune timeout; retry {self._tune_attempts}/{self._max_retries}")
-                    if self._current_url and self._mpv:
-                        self._mpv.loadfile_now(self._current_url)
-                else:
-                    self._state = TunerState.FAILED
-                    self._status_message = "No signal"
-                    self.log.out("Tune failed; max retries exceeded")
+            elif now - self._tune_started_at > self._tune_timeout_s:
+                self._retry_or_fail(now)
+
+        elif self._state == TunerState.PLAYING and ended:
+            # The stream died under us, so a frozen picture isn't playback.
+            self.log.out(f"Stream ended: {self._current_name}")
+            self._state = TunerState.TUNING
+            self._retry_or_fail(now)
 
         return TunerStatus(
             state=self._state,

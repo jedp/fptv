@@ -6,6 +6,7 @@ from ctypes import (
     POINTER, Structure, CFUNCTYPE, byref
 )
 from ctypes.util import find_library
+from enum import Enum, auto
 
 from fptv.gl import mpv_opengl_get_proc_address_fn
 from fptv.log import Logger
@@ -40,6 +41,16 @@ MPV_OPT_RENDER_API_TYPE_OPENGL = "opengl"
 # mpv_render_update_flag values
 MPV_RENDER_UPDATE_FRAME = 1 << 00
 
+# mpv_event_id values (from client.h)
+MPV_EVENT_NONE = 0
+MPV_EVENT_START_FILE = 6
+MPV_EVENT_END_FILE = 7
+MPV_EVENT_PLAYBACK_RESTART = 21
+
+# mpv_end_file_reason values (from client.h)
+MPV_END_FILE_REASON_EOF = 0
+MPV_END_FILE_REASON_ERROR = 4
+
 MPV_DEBOUNCE_PLAY_S = 0.4
 MPV_MIN_SWITCH_GAP_S = 0.35  # min time between real loadfile calls
 MPV_STOP_SETTLE_s = 0.25  # pause after stop to let server notice close
@@ -66,6 +77,20 @@ class mpv_event(Structure):
         ("reply_userdata", c_uint64),
         ("data", c_void_p),
     ]
+
+
+class mpv_event_end_file(Structure):
+    """Leading fields of mpv_event_end_file; we never allocate this ourselves."""
+    _fields_ = [
+        ("reason", c_int),
+        ("error", c_int),
+    ]
+
+
+class PlaybackEvent(Enum):
+    """Playback outcomes for the current file, as reported by mpv."""
+    STARTED = auto()  # Playback really began
+    ENDED = auto()  # The stream failed to open, or died
 
 
 class mpv_opengl_init_params(Structure):
@@ -156,6 +181,10 @@ class EmbeddedMPV:
         self._stage: str | None = None  # None | 'stop_wait'
         self._stop_until = 0.0
         self._next_url: str | None = None
+
+        # True from mpv's START_FILE until a new load is requested, so that
+        # poll_events() ignores events from a file we've already moved on from.
+        self._file_active = False
 
         # tune these
         self._debounce_s = MPV_DEBOUNCE_PLAY_S
@@ -317,6 +346,12 @@ class EmbeddedMPV:
         return self._get_property_flag(MPV_FLAG_PAUSE.encode("utf-8"))
 
     def stop(self):
+        """Stop playback, closing the stream, and forget any queued load."""
+        self._pending_url = None
+        self._next_url = None
+        self._stage = None
+        self._current_url = None
+        self._file_active = False
         self._exec("stop")
 
     def get_volume(self) -> int:
@@ -407,12 +442,18 @@ class EmbeddedMPV:
     def loadfile(self, url: str) -> None:
         """Coalesce rapid requests; latest wins."""
         self.initialize()
+        self._file_active = False
         self._pending_url = url
         self._switch_after = time.time() + self._debounce_s
 
     def loadfile_now(self, url: str) -> None:
-        """Queue a tune immediately (no debounce). Useful for watchdog recovery."""
+        """
+        Queue a tune immediately (no debounce), reopening the stream even if
+        it's the URL we last loaded: that's how retries and recovery work.
+        """
         self.initialize()
+        self._file_active = False
+        self._current_url = None
         self._pending_url = url
         self._switch_after = 0.0
 
@@ -450,17 +491,38 @@ class EmbeddedMPV:
         rc = self._mpv.mpv_render_context_render(self._render_ctx, render_params)
         return rc >= 0
 
-    def poll_events(self) -> None:
-        """Optional: drain mpv events (not required for playback, but useful for debugging)."""
+    def poll_events(self) -> list[PlaybackEvent]:
+        """Drain mpv's event queue, returning what happened to the current file."""
+        events: list[PlaybackEvent] = []
         if not self._handle:
-            return
+            return events
+
         while True:
             evp = self._mpv.mpv_wait_event(self._handle, 0.0)
             if not evp:
                 break
             ev = evp.contents
-            if ev.event_id == 0:  # MPV_EVENT_NONE
+            if ev.event_id == MPV_EVENT_NONE:
                 break
+
+            if ev.event_id == MPV_EVENT_START_FILE:
+                self._file_active = True
+
+            elif not self._file_active:
+                continue
+
+            elif ev.event_id == MPV_EVENT_PLAYBACK_RESTART:
+                events.append(PlaybackEvent.STARTED)
+
+            elif ev.event_id == MPV_EVENT_END_FILE and ev.data:
+                # Other reasons (stop, replaced by a new file) are our own doing.
+                end = ctypes.cast(ev.data, POINTER(mpv_event_end_file)).contents
+                if end.reason in (MPV_END_FILE_REASON_EOF, MPV_END_FILE_REASON_ERROR):
+                    self._file_active = False
+                    self.log.err(f"Playback ended: reason={end.reason} error={end.error}")
+                    events.append(PlaybackEvent.ENDED)
+
+        return events
 
     def _set_opt(self, name: str, value: str) -> int:
         rc = self._mpv.mpv_set_option_string(self._handle, name.encode("utf-8"), value.encode("utf-8"))
