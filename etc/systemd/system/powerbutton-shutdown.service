@@ -6,7 +6,7 @@ After=multi-user.target
 Type=simple
 
 # Hold button for 1.5s to shutdown (avoids accidental triggers)
-ExecStart=/bin/bash -c 'while true; do /usr/bin/gpiomon --num-events=1 --bias=pull-up --edges=falling -c gpiochip0 23; sleep 1.5; /usr/bin/gpioget --bias=pull-up -c gpiochip0 23 | grep -q active && /usr/bin/systemctl poweroff; done'
+ExecStart=/bin/bash -c 'while true; do /usr/bin/gpiomon --num-events=1 --bias=pull-up --edges=falling -c gpiochip0 23; sleep 1.5; /usr/bin/gpioget --numeric --bias=pull-up -c gpiochip0 23 | grep -qx 0 && /usr/bin/systemctl poweroff; done'
 
 # Restart on any falling edge on the button. Can be triggered by rapid encoder turns.
 # ExecStart=/bin/sh -c '/usr/bin/gpiomon --num-events=1 --quiet --edges=falling --bias=pull-up -c gpiochip0 23 && /usr/bin/systemctl poweroff'
