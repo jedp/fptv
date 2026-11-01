@@ -31,6 +31,10 @@ Environment=XDG_CONFIG_HOME=/var/lib/fptv
 # Keep display awake (console)
 ExecStartPre=/usr/bin/setterm --blank 0 --powerdown 0
 
+# Headphone output level, which feeds the speaker amp. The saved ALSA state
+# doesn't survive a boot, leaving it at about -20dB. "-" means non-fatal.
+ExecStartPre=-/usr/bin/amixer -q -c 0 sset PCM 0dB
+
 ExecStart=/usr/bin/python3 /opt/fptv/python/app.py
 
 # Run on the real console
