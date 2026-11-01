@@ -45,6 +45,8 @@ TTYVHangup=yes
 TTYVTDisallocate=yes
 
 # Special exit code to drop into console.
+# Headroom in case GPU sync_file descriptors leak again. See mpv.py.
+LimitNOFILE=65536
 Restart=always
 RestartSec=2
 RestartPreventExitStatus=42

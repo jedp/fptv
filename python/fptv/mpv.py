@@ -60,6 +60,11 @@ MPV_OPT_NETWORK_TIMEOUT_S = 30
 
 MPV_FLAG_PAUSE = "pause"
 
+# Withheld from mpv in _get_proc_address(). On the Pi's V3D driver, it creates
+# a fence each frame and they pile up as open sync_file descriptors, about 30
+# a second, until the process runs out. mpv works without them.
+GL_FUNCTIONS_WITHHELD = {b"glFenceSync", b"glClientWaitSync", b"glDeleteSync"}
+
 class MPVError(RuntimeError):
     pass
 
@@ -579,13 +584,16 @@ class EmbeddedMPV:
         # Don't call any mpv API here.
         self._update_event.set()
 
-    def _get_proc_address(self, _ctx: c_void_p, name: bytes) -> c_void_p:
+    def _get_proc_address(self, _ctx: c_void_p, name: bytes) -> int | None:
         """
         mpv calls this to resolve OpenGL function pointers.
 
         We try SDL_GL_GetProcAddress first (since pygame uses SDL2),
         then fall back to eglGetProcAddress if available.
         """
+        if name in GL_FUNCTIONS_WITHHELD:
+            return None
+
         if self._sdl is not None:
             try:
                 self._sdl.SDL_GL_GetProcAddress.argtypes = [c_char_p]
@@ -606,4 +614,4 @@ class EmbeddedMPV:
             except Exception:
                 pass
 
-        return c_void_p(None)
+        return None
